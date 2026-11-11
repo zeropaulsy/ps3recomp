@@ -3663,6 +3663,26 @@ static void eng_present(u32 buffer_id)
                     i, g.surfaces[i].location, g.surfaces[i].offset,
                     g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
     }
+    /* RSX_PRESENT_LOG=1: log each distinct (buffer, surface, offset, size,
+     * format, found by address) a present uses, and a count every 600. */
+    { static int on = -1; static u32 seen[64][6]; static u32 nseen; static u32 n, fallback;
+      if (on < 0) { const char* e = getenv("RSX_PRESENT_LOG"); on = (e && *e == '1') ? 1 : 0; }
+      if (on) {
+          const eng_surface* ps = &g.surfaces[target];
+          const int by_addr = buffer_id < 8 && g.display_buffers[buffer_id].valid &&
+                              ps->location == g.display_buffers[buffer_id].location &&
+                              ps->offset == g.display_buffers[buffer_id].offset;
+          if (!by_addr) fallback++;
+          const u32 key[6] = { buffer_id, target, ps->offset, ps->w << 16 | ps->h, (u32)ps->fmt, (u32)by_addr };
+          u32 k = 0;
+          for (; k < nseen; k++) if (!memcmp(seen[k], key, sizeof key)) break;
+          if (k == nseen && nseen < 64) {
+              memcpy(seen[nseen++], key, sizeof key);
+              fprintf(stderr, "[present] new combo: buffer %u -> surface %u off 0x%08X %ux%u fmt %u by_addr %d (frame %u)\n",
+                      buffer_id, target, ps->offset, ps->w, ps->h, (u32)ps->fmt, by_addr, g.frames);
+          }
+          if (++n % 600 == 0) fprintf(stderr, "[present] %u presents, %u by fallback\n", n, fallback);
+      } }
     pd_present(target);
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);

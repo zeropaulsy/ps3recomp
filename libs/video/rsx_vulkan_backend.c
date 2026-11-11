@@ -2053,6 +2053,26 @@ static void vk_present_complete_locked(void)
     size_t c = ((size_t)(s_vk.height / 2) * s_vk.width + s_vk.width / 2) * 4;
     s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
     s_vk.presented++;
+    /* VK_BLACK_STATS=1: count presents whose 256 sampled pixels are all
+     * black; print the tally every 300 presents. */
+    { static int on = -1; static unsigned black, total, run, maxrun;
+      if (on < 0) { const char* e = getenv("VK_BLACK_STATS"); on = (e && *e == '1') ? 1 : 0; }
+      if (on) {
+          unsigned any = 0;
+          for (u32 k = 0; k < 256 && !any; k++) {
+              const size_t x = (size_t)(k % 16) * s_vk.width / 16 + s_vk.width / 32;
+              const size_t y = (size_t)(k / 16) * s_vk.height / 16 + s_vk.height / 32;
+              const unsigned char* q = px + (y * s_vk.width + x) * 4;
+              any |= q[0] | q[1] | q[2];
+          }
+          total++;
+          if (!any) { black++; run++; if (run > maxrun) maxrun = run; } else run = 0;
+          if (total % 300 == 0) {
+              fprintf(stderr, "[vk-black] presents %u..%u: %u black (longest run %u)\n",
+                      s_vk.presented - 299, s_vk.presented, black, maxrun);
+              black = 0; maxrun = 0;
+          }
+      } }
     if (s_vk.dump_path && (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
     vk_present_window();
 }
