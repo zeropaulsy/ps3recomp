@@ -388,6 +388,32 @@ static int gcm_user_queue_on(void)
 static u32 s_acq_off, s_acq_val;
 static unsigned long long s_acq_t0;
 
+/* GCM_SEMA_STATS=1: every 10 s, per label, how many semaphore acquires were
+ * already satisfied, how many waited (and for how long in total), and how many
+ * gave up (GCM_SEMA_ACQUIRE_MS); the first few give-ups also dump the user
+ * command queue and the FIFO after the stuck acquire. */
+static struct { u32 imm, waited, timeouts; unsigned long long wait_ms, t0; u32 last_v, last_seen; } s_lsem[256];
+static int gcm_sema_stats_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("GCM_SEMA_STATS"); v = (e && *e == '1') ? 1 : 0; }
+    return v;
+}
+static void gcm_sema_stats_tick(unsigned long long now)
+{
+    static unsigned long long last;
+    if (!last) last = now;
+    if (now - last < 10000ull) return;
+    last = now;
+    for (int i = 0; i < 256; i++) {
+        if (!s_lsem[i].imm && !s_lsem[i].waited && !s_lsem[i].timeouts) continue;
+        fprintf(stderr, "[sema-stats] label 0x%02X: ready %u waited %u (%llu ms) timeouts %u last want 0x%08X saw 0x%08X\n",
+                i, s_lsem[i].imm, s_lsem[i].waited, s_lsem[i].wait_ms, s_lsem[i].timeouts,
+                s_lsem[i].last_v, s_lsem[i].last_seen);
+        s_lsem[i].imm = s_lsem[i].waited = s_lsem[i].timeouts = 0; s_lsem[i].wait_ms = 0;
+    }
+}
+
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
 static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
 
@@ -2781,6 +2807,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         ps3_ft_span(PS3_FT_SEMA, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
                         s_ft_sema_t0 = 0;
                     }
+                    if (m == 0x68u && gcm_sema_stats_on()) {
+                        extern unsigned long long ps3_ms_now(void);
+                        const unsigned long long nw = ps3_ms_now();
+                        const u32 li = (s_sema_offset >> 4) & 0xFFu, cur = vm_read32(la);
+                        s_lsem[li].last_v = v; s_lsem[li].last_seen = cur;
+                        if (cur == v) {
+                            if (s_lsem[li].t0) { s_lsem[li].waited++; s_lsem[li].wait_ms += nw - s_lsem[li].t0; s_lsem[li].t0 = 0; }
+                            else s_lsem[li].imm++;
+                        } else if (!s_lsem[li].t0) s_lsem[li].t0 = nw;
+                        gcm_sema_stats_tick(nw);
+                    }
                     if (m == 0x68u && s_acq_t0 && s_acq_off == s_sema_offset &&
                         s_acq_val == v && vm_read32(la) == v)
                         s_acq_t0 = 0;                /* satisfied: the bounded wait ends */
@@ -2822,10 +2859,52 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 if (!s_acq_t0 || s_acq_off != s_sema_offset || s_acq_val != v) {
                     s_acq_off = s_sema_offset; s_acq_val = v; s_acq_t0 = now;
                 }
+                /* GCM_SEMA_TRAP_MS=<ms>: raise SIGTRAP once per acquire that has
+                 * been blocked that long, so a debugger can look at who should
+                 * have written the label. Only useful under a debugger: without
+                 * one SIGTRAP ends the process. */
+#ifdef SIGTRAP
+                { static long trap_ms = -2; static unsigned long long trapped_t0;
+                  if (trap_ms == -2) { const char* e = getenv("GCM_SEMA_TRAP_MS"); trap_ms = e ? atol(e) : -1; }
+                  if (trap_ms > 0 && s_acq_t0 && trapped_t0 != s_acq_t0 &&
+                      now - s_acq_t0 >= (unsigned long long)trap_ms) {
+                      trapped_t0 = s_acq_t0;
+                      fprintf(stderr, "[sema-trap] label 0x%02X want 0x%08X waited %llu ms\n",
+                              (s_sema_offset >> 4) & 0xFFu, v, now - s_acq_t0);
+                      raise(SIGTRAP);
+                  } }
+#endif
                 if (!blk_ms || now - s_acq_t0 < blk_ms) {
                     if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
                     sem_blocked = 1; break;
                 }
+                if (gcm_sema_stats_on()) { const u32 li = (s_sema_offset >> 4) & 0xFFu;
+                    s_lsem[li].timeouts++; s_lsem[li].wait_ms += blk_ms; s_lsem[li].t0 = 0;
+                    /* What follows the stuck acquire: user commands, semaphore and
+                     * label methods in the next 512 words (linear; a branch ends it). */
+                    static int nd; if (nd++ < 6) {
+                        AcquireSRWLockExclusive(&s_uq_lock);
+                        const unsigned qh = s_uq_head, qt = s_uq_tail;
+                        ReleaseSRWLockExclusive(&s_uq_lock);
+                        fprintf(stderr, "[sema-dump] label 0x%02X stuck at get=0x%08X; user queue head=%u tail=%u pending=%llu\n",
+                                li, s_fifo_getoff, qh, qt, (unsigned long long)s_user_pending);
+                        u32 o = s_fifo_getoff;
+                        for (int k = 0; k < 512; k++) {
+                            const u32 ea = gcm_io2ea(o); if (!ea) break;
+                            const u32 w = vm_read32(ea);
+                            if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 2u || (w & 3u) == 1u) {
+                                fprintf(stderr, "[sema-dump]   +%u branch word 0x%08X (scan ends)\n", o - s_fifo_getoff, w); break; }
+                            if ((w & 0xE0030003u) == 0 && w) {
+                                const u32 cnt = (w >> 18) & 0x7FFu, mth = w & 0x1FFCu, sc = (w >> 13) & 7u;
+                                const u32 mf = (sc << 13) | mth;
+                                if (mf == 0xEB00u || mf == 0xEB04u || (sc == 0 && (mth == 0x64u || mth == 0x68u || mth == 0x6Cu)) ||
+                                    mth == 0x1D6Cu || mth == 0x1D70u || mth == 0x1D74u || (sc == 0 && mth == 0x50u))
+                                    fprintf(stderr, "[sema-dump]   +%u sc%u m=0x%04X x%u data0=0x%08X\n",
+                                            o - s_fifo_getoff, sc, mth, cnt, cnt ? vm_read32(gcm_io2ea(o + 4)) : 0);
+                                o += 4 + cnt * 4;
+                            } else o += 4;
+                        }
+                    } }
                 { static int tn; if (PS3_LOG_FIRST(tn, 12))
                     fprintf(stderr, "[SEMA] acquire off=0x%X == 0x%08X gave up after %u ms (label 0x%08X)\n",
                             s_sema_offset, v, blk_ms, vm_read32(la)); }
