@@ -350,6 +350,33 @@ static _Atomic(u64) s_user_pending = 0;
 #define GCM_USER_PENDING_TAKE() atomic_exchange(&s_user_pending, 0)
 #endif
 
+/* GCM_USER_QUEUE=1: queue every retired user command (a ring of GCM_UQ_N) and
+ * have the pump deliver each one, in order. By default a user command retired
+ * before the pump delivered the previous one replaces it, like a driver cause
+ * register; each replacement is now logged as "[gcm-user] coalesced".
+ *
+ * A title whose user handler does per-command work loses events that way.
+ * LittleBigPlanet 2's handler releases a different SPU job-list gate for each
+ * argument; a replaced command left one gate closed for good and the game froze
+ * at its first level transition. It happens when the FIFO walker retires two
+ * commands before any guest thread reaches a pump, which a fast backend makes
+ * likely. RPCS3's HLE path delivers each user command on its own as well. */
+#define GCM_UQ_N 256u
+static u32 s_uq[GCM_UQ_N];
+static unsigned s_uq_head, s_uq_tail;          /* tail = next write, head = next read */
+static SRWLOCK s_uq_lock = SRWLOCK_INIT;
+static int gcm_user_queue_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("GCM_USER_QUEUE"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v;
+}
+#ifdef _WIN32
+#define GCM_USER_PENDING_SWAP(value) ((u64)InterlockedExchange64(&s_user_pending, (LONG64)(value)))
+#else
+#define GCM_USER_PENDING_SWAP(value) atomic_exchange(&s_user_pending, (value))
+#endif
+
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
 static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
 
@@ -968,7 +995,16 @@ void ppu_gcm_pump(void)
     }
     if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
-    u64 user = GCM_USER_PENDING_TAKE();
+    u64 user = 0;
+    u32 ubatch[GCM_UQ_N]; unsigned nub = 0;      /* GCM_USER_QUEUE: claimed here, as `user` is */
+    if (gcm_user_queue_on()) {
+        AcquireSRWLockExclusive(&s_uq_lock);
+        (void)GCM_USER_PENDING_TAKE();
+        while (s_uq_head != s_uq_tail) ubatch[nub++] = s_uq[s_uq_head++ % GCM_UQ_N];
+        ReleaseSRWLockExclusive(&s_uq_lock);
+    } else {
+        user = GCM_USER_PENDING_TAKE();
+    }
     /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
     { static int d = -1; static unsigned nv, nf, calls;
       if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
@@ -1003,6 +1039,9 @@ void ppu_gcm_pump(void)
         if (s_user_handler_opd && g_ps3_guest_caller)
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
     }
+    for (unsigned i = 0; i < nub; i++)
+        if (s_user_handler_opd && g_ps3_guest_caller)
+            g_ps3_guest_caller(s_user_handler_opd, (uint64_t)ubatch[i], 0, 0, 0, 0, 0, 0, 0);
     GCM_PUMP_LEAVE();
 }
 
@@ -4640,7 +4679,28 @@ void cellGcmSetUserCommand(u32 cmd)
 void cellGcmQueueUserCommand(u32 cmd)
 {
     GCM_USER_STORE(cmd);
-    GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
+    if (gcm_user_queue_on()) {
+        AcquireSRWLockExclusive(&s_uq_lock);
+        if (s_uq_tail - s_uq_head >= GCM_UQ_N) {   /* full: drop the oldest, say so */
+            static unsigned long drops;
+            if (++drops <= 16 || (drops & 1023) == 0)
+                fprintf(stderr, "[gcm-user] queue full, dropped 0x%X (drops=%lu)\n",
+                        s_uq[s_uq_head % GCM_UQ_N], drops);
+            s_uq_head++;
+        }
+        s_uq[s_uq_tail++ % GCM_UQ_N] = cmd;
+        GCM_USER_PENDING_STORE((1ULL << 32) | cmd);   /* the pump's fast-path flag */
+        ReleaseSRWLockExclusive(&s_uq_lock);
+    } else {
+        u64 old = GCM_USER_PENDING_SWAP((1ULL << 32) | cmd);
+        if (old) {
+            static volatile long n;
+            long k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
+            if (k <= 16 || (k & 255) == 0)
+                fprintf(stderr, "[gcm-user] coalesced: 0x%X replaced undelivered 0x%X (#%ld)\n",
+                        cmd, (u32)old, k);
+        }
+    }
 #ifdef _WIN32
     gcm_pump_wake();
 #endif
