@@ -125,7 +125,7 @@ extern "C" {
  * Structures
  * -----------------------------------------------------------------------*/
 
-/* Keyboard data returned by cellKbGetData */
+/* Keyboard data returned by cellKbRead */
 typedef struct CellKbData {
     u32 led;                            /* LED state flags */
     u32 mkey;                           /* Modifier key flags */
@@ -147,7 +147,7 @@ typedef struct CellKbInfo {
 
 s32 cellKbInit(u32 max_connect);
 s32 cellKbEnd(void);
-s32 cellKbGetData(u32 port_no, CellKbData* data);
+s32 cellKbRead(u32 port_no, CellKbData* data);
 s32 cellKbGetInfo(CellKbInfo* info);
 s32 cellKbSetReadMode(u32 port_no, u32 rmode);
 s32 cellKbSetCodeType(u32 port_no, u32 codetype);

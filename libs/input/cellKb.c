@@ -154,8 +154,14 @@ s32 cellKbEnd(void)
 }
 
 /* Guest CellKbData layout (big-endian): +0x00 led u32, +0x04 mkey u32,
- * +0x08 len s32, +0x0C keycode[62] u16. */
-s32 cellKbGetData(u32 port_no, CellKbData* data)
+ * +0x08 len s32, +0x0C keycode[62] u16.
+ *
+ * The SDK name is cellKbRead (sys_io NID 0xFF0A21B7). The HLE table derives
+ * NIDs from function names, so under any other name the import stays
+ * unresolved and is faked as CELL_OK with CellKbData left unwritten, while
+ * cellKbInit reports a keyboard on port 0. LittleBigPlanet 2 then looped over
+ * a stale `len` from its stack and grew a vector until a 60 MB pool ran out. */
+s32 cellKbRead(u32 port_no, CellKbData* data)
 {
     unsigned long long ea = (unsigned int)(uintptr_t)data;
 
