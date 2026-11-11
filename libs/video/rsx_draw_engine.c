@@ -3609,23 +3609,49 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 /* Resolve a flip's buffer id to a REGISTERED surface rather than whatever is
  * currently bound: the live target at that instant is often an offscreen
  * shadow or post-process surface, and copying it presents black despite the
- * scene's draws having executed (rsx_live_draw.c:7557-7570). */
-static u32 eng_present_surface(u32 buffer_id)
+ * scene's draws having executed (rsx_live_draw.c:7557-7570).
+ *
+ * A surface at the display buffer's address that is SMALLER than the buffer is
+ * not its scanout. LittleBigPlanet 2 binds display buffer 0's memory as a
+ * 768x768 colour-masked dummy target for its shadow pass while it builds the
+ * frame for buffer 1; the engine's surface record at that address then
+ * describes the dummy, and re-presenting buffer 0 between flips
+ * (rsx_draw_engine_present) showed it: black frames, about a third of all
+ * presents once the RSX ran alongside frame building. With *skip non-NULL such a
+ * present is skipped, so the window keeps its last image. */
+static u32 eng_present_surface_ex(u32 buffer_id, int* skip)
 {
     if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
         const eng_display_buffer* d = &g.display_buffers[buffer_id];
+        int at_addr = 0;
         for (u32 i = 0; i < g.n_surfaces; i++)
             if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
-                g.surfaces[i].offset == d->offset)
-                return i;
+                g.surfaces[i].offset == d->offset) {
+                at_addr = 1;
+                if (!d->width || !d->height ||
+                    (g.surfaces[i].w >= d->width && g.surfaces[i].h >= d->height))
+                    return i;
+            }
+        if (at_addr && skip) { *skip = 1; return ENG_INVALID; }
     }
     return eng_current_surface();
 }
 
+static int s_eng_repres;   /* set by rsx_draw_engine_present: a re-present, not a flip */
+
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
-    const u32 target = eng_present_surface(buffer_id);
+    int skip = 0;
+    u32 target = eng_present_surface_ex(buffer_id, &skip);
+    if (skip) {
+        static unsigned ns;
+        if (PS3_LOG_FIRST(ns, 4))
+            fprintf(stderr, "[rsx engine] buffer %u: the surface at its address is smaller than the "
+                            "buffer, not presenting it\n", buffer_id);
+        if (s_eng_repres) return;
+        target = eng_current_surface();       /* a real flip: as before */
+    }
     if (target == ENG_INVALID) return;
     g.surfaces[target].last_use = g.frames;
     if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
@@ -3787,7 +3813,9 @@ void rsx_draw_engine_present(void)
      * re-present a double-buffered title's OTHER scanout. Presenting twice is
      * harmless either way -- the engine never clears the surface, so a second
      * present just blits the same image again. */
+    s_eng_repres = 1;
     eng_present(g.last_flip_buffer);
+    s_eng_repres = 0;
 }
 
 void rsx_draw_engine_present_buffer(u32 buffer_id)
