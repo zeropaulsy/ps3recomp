@@ -550,6 +550,18 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
  * compare-and-swap under one global lock across all SPU host threads.
  * ===========================================================================*/
 extern uint8_t* vm_base;
+/* The WWS job-manager policy module's image id, SPU_WWS_PM_IMAGE=<id> (default
+ * 2). The checks below were written for a title where it is image 2, but image
+ * ids are assigned per title by gen_spu_workloads.py: in LittleBigPlanet 2 the
+ * pm_wwsjob module is image 1, so no job module ever matched and every Wws job
+ * ran in the SPU interpreter. Deriving the id from the registered policy
+ * module would be better; this keeps the old behaviour by default. */
+static int spu_wws_pm_image(void)
+{
+    static int s_id = -1;
+    if (s_id < 0) { const char* e = getenv("SPU_WWS_PM_IMAGE"); s_id = e ? atoi(e) : 2; }
+    return s_id;
+}
 
 /* The spinlock guarding all atomic line ops now lives in spu_coherency.c as
  * spu_lockline_lock/unlock. It used to be a file-static here, which serialized
@@ -2484,7 +2496,7 @@ static int spu_smc_microstep(spu_context* ctx)
      * the first access has read their switches); otherwise the generic path
      * below runs them. */
     const int ldst_fast = g_spu_ls_watch_n == 0 && g_spu_ls_probe == 0 &&
-                          g_spu_smc_watch == 0 && ctx->image_id != 2;
+                          g_spu_smc_watch == 0 && ctx->image_id != spu_wws_pm_image();
     for (int steps = 0; steps < 4096; steps++) {
         if (ldst_fast) {
             for (; steps < 4096; steps++, pc = (pc + 4) & SPU_LS_MASK) {
@@ -2989,7 +3001,7 @@ void spu_indirect_branch(spu_context* ctx)
      * ila header identifies which of the 89 lifted job modules it is; match it and
      * mark that overlay resident so the module's lifted functions dispatch. The
      * module arrives via a DMA LIST, so the single-GET note_get hook never fired. */
-    if (!fn && ctx->image_id == 2 && ctx->pc >= 0x4000 && ctx->pc < 0x3E000) {
+    if (!fn && ctx->image_id == spu_wws_pm_image() && ctx->pc >= 0x4000 && ctx->pc < 0x3E000) {
         uint32_t codeBase = ((uint32_t)ctx->ls[0x1320] << 24) | ((uint32_t)ctx->ls[0x1321] << 16) |
                             ((uint32_t)ctx->ls[0x1322] << 8) | ctx->ls[0x1323];
         if (codeBase + 16 <= SPU_LS_SIZE) {
@@ -3018,7 +3030,7 @@ void spu_indirect_branch(spu_context* ctx)
      * file offset: that ran garbage, the job did no work, and its ring slot
      * never advanced -> the loader's job ring deadlocked. An empty buffer falls
      * through to the null-job handling below. */
-    if (!fn && ctx->image_id == 2 && ctx->policy_mode &&
+    if (!fn && ctx->image_id == spu_wws_pm_image() && ctx->policy_mode &&
         ctx->pc >= 0x4000 && ctx->pc < 0x3E000) {
         uint32_t w0 = ((uint32_t)ctx->ls[ctx->pc] << 24) | ((uint32_t)ctx->ls[ctx->pc+1] << 16) |
                       ((uint32_t)ctx->ls[ctx->pc+2] << 8) | ctx->ls[ctx->pc+3];
@@ -3030,7 +3042,7 @@ void spu_indirect_branch(spu_context* ctx)
      * bookkeeping -- exactly as a real job that did nothing and returned.
      * (Falling to the SMC microstep would log a spurious BRANCH-TO-0 on the
      * 0x00000000 word; this is the same outcome, quiet.) */
-    if (!fn && ctx->image_id == 2 && ctx->policy_mode &&
+    if (!fn && ctx->image_id == spu_wws_pm_image() && ctx->policy_mode &&
         ctx->pc >= 0x4000 && ctx->pc < 0x3E000 &&
         ((uint32_t)ctx->ls[ctx->pc] | ctx->ls[ctx->pc+1] |
          ctx->ls[ctx->pc+2] | ctx->ls[ctx->pc+3]) == 0) {
@@ -3183,7 +3195,7 @@ void spu_indirect_branch(spu_context* ctx)
      * with a return link in r0 (0x31C8 sets 0x3258); route the kernel-return
      * there: the PM resumes its post-job flow, which is exactly what the jm2
      * kernel hand-back does on hardware. */
-    if (ctx->image_id == 2 && ctx->policy_mode && ctx->pc == 0 &&
+    if (ctx->image_id == spu_wws_pm_image() && ctx->policy_mode && ctx->pc == 0 &&
         (ctx->gpr[0]._u32[0] & SPU_LS_MASK) >= 0xA00 &&
         (ctx->gpr[0]._u32[0] & SPU_LS_MASK) < 0x3700) {
         static int _n = 0;
@@ -3217,7 +3229,7 @@ void spu_indirect_branch(spu_context* ctx)
         spu_halt(ctx);
         return;
     }
-    if (ctx->image_id == 2 &&
+    if (ctx->image_id == spu_wws_pm_image() &&
         ((ctx->pc >= 0x3700 && ctx->pc < 0x3FE80) ||
          (ctx->pc < 0xA00 && ctx->pc != SPURS_PM_EXIT_TO_KERNEL_LS &&
           ctx->pc != SPURS_PM_SELECT_WORKLOAD_LS))) {
