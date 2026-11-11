@@ -377,6 +377,17 @@ static int gcm_user_queue_on(void)
 #define GCM_USER_PENDING_SWAP(value) atomic_exchange(&s_user_pending, (value))
 #endif
 
+/* The GCM_SEMA_ACQUIRE_MS bound: which acquire is blocked and since when. A
+ * satisfied acquire clears it (see the ACQUIRE handling in the FIFO walker).
+ * It used to be static inside the blocked branch and cleared only on a give-up,
+ * so after a wait that ended normally the next block on the same offset and
+ * value inherited the old start time and gave up at once. A title that
+ * acquires one label for the same value every frame (LittleBigPlanet 2's
+ * vsync label) got several false give-ups a second, each letting the RSX run
+ * ahead of the data it was told to wait for. */
+static u32 s_acq_off, s_acq_val;
+static unsigned long long s_acq_t0;
+
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
 static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
 
@@ -2770,6 +2781,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         ps3_ft_span(PS3_FT_SEMA, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
                         s_ft_sema_t0 = 0;
                     }
+                    if (m == 0x68u && s_acq_t0 && s_acq_off == s_sema_offset &&
+                        s_acq_val == v && vm_read32(la) == v)
+                        s_acq_t0 = 0;                /* satisfied: the bounded wait ends */
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) {
                         /* The RSX has fetched past a RELEASE before its
@@ -2803,18 +2817,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * <ms> on the same acquire it is consumed and said so. inFAMOUS 2
                  * acquires a label its SPU lighting writes each frame: waiting
                  * here is what orders the RSX's sampling after that write. */
-                static u32 b_off, b_val; static unsigned long long b_t0;
                 extern unsigned long long ps3_ms_now(void);
                 const unsigned long long now = ps3_ms_now();
-                if (!b_t0 || b_off != s_sema_offset || b_val != v) { b_off = s_sema_offset; b_val = v; b_t0 = now; }
-                if (!blk_ms || now - b_t0 < blk_ms) {
+                if (!s_acq_t0 || s_acq_off != s_sema_offset || s_acq_val != v) {
+                    s_acq_off = s_sema_offset; s_acq_val = v; s_acq_t0 = now;
+                }
+                if (!blk_ms || now - s_acq_t0 < blk_ms) {
                     if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
                     sem_blocked = 1; break;
                 }
                 { static int tn; if (PS3_LOG_FIRST(tn, 12))
                     fprintf(stderr, "[SEMA] acquire off=0x%X == 0x%08X gave up after %u ms (label 0x%08X)\n",
                             s_sema_offset, v, blk_ms, vm_read32(la)); }
-                b_t0 = 0;
+                s_acq_t0 = 0;
             }
         }
                 }
