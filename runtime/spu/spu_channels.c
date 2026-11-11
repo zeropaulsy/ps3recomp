@@ -2961,7 +2961,24 @@ void spu_indirect_branch(spu_context* ctx)
               if (PS3_LOG_FIRST(_n, 8))
                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
                           "(runtime-loaded code)\n", ctx->image_id, p);
-              spu_interp_run(ctx, p);
+              /* Stop at the callee's return address. The
+               * lifted caller does `spu_link(ret); spu_indirect_branch();
+               * spu_drain_call(ctx, ret)`, so ret (the link register on
+               * entry) is a mid-function address with no lifted entry. Plain
+               * spu_interp_run ran on through the caller's continuation to
+               * the next lifted entry, after which the host frame resumed and
+               * ran that continuation (stack adjustment included) a second
+               * time -- LittleBigPlanet 2's FMOD mixer, which calls DSP plugins
+               * it relocates at run time, then lost its stack and ended the
+               * task. ctx->drain_ret_pc is not usable here: this runs before
+               * the caller's drain has set it, so it is the outer drain's. */
+              const uint32_t ret = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+              spu_interp_run_until(ctx, p, ret);
+              /* As the microstep hand-off does: a rejoin at a lifted entry
+               * other than ret is a transfer, so keep the drain going. */
+              if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
+                  (ctx->pc & SPU_LS_MASK) != ret && spu_lifted_lookup(ctx, ctx->pc))
+                  g_spu_trampoline_fn = spu_indirect_branch;
               return;
           } }
         spu_halt(ctx);
