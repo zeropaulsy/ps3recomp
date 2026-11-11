@@ -2892,6 +2892,13 @@ static u32 sink_bind_vertex_textures(
  * also writes one line per draw to <dir>/draws.txt: its pipeline, colour
  * mask, blend, depth state and the textures it samples.
  *
+ * RSX_ENGINE_PASS_DUMP_PROBE=x,y,w,h adds to each draws.txt line the mean
+ * colour of that rectangle of the pass's first RGBA8 target before the draw
+ * (a readback per draw, so slow), which finds the draw that paints a region.
+ * RSX_ENGINE_PASS_DUMP_TRIGGER=<path> starts the capture at the first draw
+ * after <path> exists instead (checked once a second), so a script watching the
+ * screen can start it when a scene shows up at an unpredictable time.
+ *
  * The question it answers is which pass of a multi-pass frame first comes out
  * wrong. */
 static struct {
@@ -2900,6 +2907,8 @@ static struct {
     u32 min_draws;
     u32 after_s;
     u32 max_passes;
+    const char* trigger;    /* RSX_ENGINE_PASS_DUMP_TRIGGER */
+    time_t trigger_checked;
     time_t start;
     FILE* index;
     FILE* draws_log;        /* RSX_ENGINE_PASS_DUMP_DRAWS: one line a draw */
@@ -2935,8 +2944,23 @@ static int pd_capturing(void)
         s_pd.after_s = a ? (u32)strtoul(a, NULL, 0) : 0u;
         const char* x = getenv("RSX_ENGINE_PASS_DUMP_MAX");
         s_pd.max_passes = x ? (u32)strtoul(x, NULL, 0) : 64u;
+        s_pd.trigger = getenv("RSX_ENGINE_PASS_DUMP_TRIGGER");
         s_pd.start = time(NULL);
         s_pd.state = (s_pd.dir && *s_pd.dir) ? 1 : 3;
+    }
+    if (s_pd.state == 1 && s_pd.trigger && *s_pd.trigger) {
+        const time_t now = time(NULL);
+        if (now != s_pd.trigger_checked) {
+            s_pd.trigger_checked = now;
+            FILE* t = fopen(s_pd.trigger, "r");
+            if (t) {
+                fclose(t);
+                if (pd_open_index())
+                    fprintf(s_pd.index, "from a draw of frame %u, on %s, %.0f s in\n",
+                            g.frames, s_pd.trigger, difftime(now, s_pd.start));
+            }
+        }
+        return s_pd.state == 2;
     }
     if (s_pd.state == 1 && s_pd.after_s &&
         difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s && pd_open_index())
@@ -3096,6 +3120,33 @@ static int eng_poly_offset_on(void)
 
 /* A draw (or, with rs NULL, a clear) into this target set: close the pass
  * when the set changed, and describe the first draw of a new one. */
+/* RSX_ENGINE_PASS_DUMP_PROBE: the mean colour of a rectangle of the current
+ * pass's first target, appended to the draws.txt line being written. */
+static void pd_probe(void)
+{
+    static int parsed;
+    static u32 px, py, pw, ph;
+    if (!parsed) {
+        parsed = 1;
+        const char* e = getenv("RSX_ENGINE_PASS_DUMP_PROBE");
+        if (!e || sscanf(e, "%u,%u,%u,%u", &px, &py, &pw, &ph) != 4) pw = ph = 0;
+    }
+    if (!pw || !ph || !s_pd.n_targets || !g.be->readback) return;
+    const eng_surface* sf = &g.surfaces[s_pd.targets[0]];
+    if (!sf->handle || sf->fmt != RSX_BE_FMT_R8G8B8A8 || px + pw > sf->w || py + ph > sf->h)
+        return;
+    u8* buf = (u8*)malloc((size_t)pw * ph * 4u);
+    if (!buf) return;
+    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    g.be->readback(g.be->user, sf->handle, px, py, pw, ph, buf, pw * 4u);
+    unsigned long long sum[3] = {0, 0, 0};
+    for (size_t i = 0; i < (size_t)pw * ph; i++)
+        for (u32 c = 0; c < 3; c++) sum[c] += buf[i * 4u + c];
+    const unsigned long long n = (unsigned long long)pw * ph;
+    fprintf(s_pd.draws_log, " | before %llu,%llu,%llu", sum[0] / n, sum[1] / n, sum[2] / n);
+    free(buf);
+}
+
 static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
                     const rsx_be_render_state* rs, u32 pipeline, u32 tex_mask)
 {
@@ -3141,6 +3192,7 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
             fprintf(s_pd.draws_log, " t%u %u:0x%08X f%02X %ux%u", u, t.location, t.offset,
                     t.format & 0xFFu, t.width, t.height);
         }
+        pd_probe();
         fprintf(s_pd.draws_log, "\n");
     }
     if (s_pd.draws++) return;
@@ -3191,7 +3243,8 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
 static void pd_present(u32 presented)
 {
     if (s_pd.state == 0) pd_capturing();
-    if (s_pd.state == 1 && !s_pd.after_s && g.guest_draws >= s_pd.min_draws) {
+    if (s_pd.state == 1 && !s_pd.after_s && !(s_pd.trigger && *s_pd.trigger) &&
+        g.guest_draws >= s_pd.min_draws) {
         if (pd_open_index())
             fprintf(s_pd.index, "frame %u (after a frame of %u guest draws)\n",
                     g.frames + 1, g.guest_draws);
