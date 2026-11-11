@@ -395,9 +395,25 @@ s32 cellFiberPpuCreateFiber(CellFiberPpuScheduler* scheduler, CellFiberPpu* fibe
     s32 rc = CELL_OK;
     if (!s) {
         rc = (s32)CELL_FIBER_ERROR_INVAL;
-    } else if (find_fiber(fiber_ea)) {
-        rc = (s32)CELL_FIBER_ERROR_STAT;
     } else {
+        /* An ended fiber's CellFiberPpu may be reused for a new fiber. Its DONE
+         * record used to stay in s_fibers, so creating a fiber at the same
+         * address failed with STAT (LittleBigPlanet 2's fiber job system reuses
+         * a finished worker batch's blocks, ignored the error and signalled the
+         * dead fiber forever). Drop the DONE record; if RunFibers has not
+         * released its host stack yet, only detach it from the address and let
+         * RunFibers free it. */
+        Fiber** pp = &s_fibers;
+        while (*pp && (*pp)->ea != fiber_ea) pp = &(*pp)->next;
+        Fiber* old = *pp;
+        if (old && old->state != F_DONE) {
+            rc = (s32)CELL_FIBER_ERROR_STAT;
+        } else if (old) {
+            if (old->host_stack) old->ea = 0;
+            else { *pp = old->next; free(old); }
+        }
+    }
+    if (rc == CELL_OK && s) {
         f->sched = s;
         f->seq   = s_seq++;
         f->next  = s_fibers;
