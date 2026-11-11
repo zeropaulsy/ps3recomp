@@ -1354,6 +1354,22 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                   s_since = now;
                   if (s_log) spu_dma_repeat_log_start(spu);
               }
+              /* SPU_DMA_REPEAT_EXEMPT=<id>[,<id>...]: never halt those images
+               * (they still get the back-off). A task that legitimately waits
+               * on a control block for longer than the limit is otherwise
+               * killed: LittleBigPlanet 2's image 8 task set waits on its
+               * 64-byte control block between frames and stopped the game
+               * after ~6 minutes. */
+              static uint32_t s_exempt = 0xFFFFFFFFu;
+              if (s_exempt == 0xFFFFFFFFu) {
+                  uint32_t m = 0; const char* e = getenv("SPU_DMA_REPEAT_EXEMPT");
+                  while (e && *e) { long v = strtol(e, (char**)&e, 0); if (v >= 0 && v < 32) m |= 1u << v;
+                                    while (*e == ',' || *e == ' ') e++; if (*e && (*e < '0' || *e > '9')) break; }
+                  s_exempt = m;
+              }
+              if (spu->image_id >= 0 && spu->image_id < 32 && (s_exempt >> spu->image_id) & 1u) {
+                  if (now - s_since < s_backoff_ms) SwitchToThread(); else Sleep(1);
+              } else
               if (now - s_since >= s_secs * 1000u) {
                   s_rep = 0; s_since = 0;   /* re-arm: the chain may run this job again */
                   extern void spu_halt(spu_context*);
