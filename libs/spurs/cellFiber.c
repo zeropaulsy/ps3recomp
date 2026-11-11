@@ -448,6 +448,15 @@ s32 cellFiberPpuRunFibers(CellFiberPpuScheduler* scheduler)
         Fiber* f = pick_runnable(s);
         if (!f) {
             if (all_done(s)) break;
+            /* CELL_FIBER_RUN_RETURNS=1: return once nothing is runnable instead
+             * of waiting for another thread to signal a fiber. LittleBigPlanet 2
+             * calls RunFibers once per frame from its main loop and sends the
+             * signals that wake its worker fibers from that same loop after
+             * RunFibers returns; waiting here froze its main thread. The default
+             * keeps the blocking behaviour tests/fiber_switch asserts. */
+            static int s_returns = -1;
+            if (s_returns < 0) { const char* e = getenv("CELL_FIBER_RUN_RETURNS"); s_returns = (e && *e == '1') ? 1 : 0; }
+            if (s_returns) break;
             WAIT();              /* its fibers wait for a signal, or a join, that another thread delivers */
             continue;
         }
