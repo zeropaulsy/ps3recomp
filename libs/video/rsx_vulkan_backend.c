@@ -95,6 +95,7 @@
     X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
     X(vkCreateSampler) X(vkDestroySampler) \
     X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
+    X(vkCmdClearAttachments) \
     X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImage) \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
@@ -3495,6 +3496,115 @@ static VkImageView vk_eng_scratch_depth(u32 w, u32 h)
     return s_e2.scratch_depth.view;
 }
 
+/* A clear whose scissor leaves part of the target alone (rsx_draw_backend
+ * clear_color_rect / clear_depth_stencil_rect). vkCmdClearColorImage only
+ * clears whole subresources, so this opens a render pass on the one target
+ * (contents loaded, as every draw's is) and clears the rectangle with
+ * vkCmdClearAttachments. Without it the engine fell back to clearing the
+ * whole target: LittleBigPlanet 2 builds its 2048x2048 sticker atlas a
+ * 128x128 tile at a time, each tile a scissored clear and then its stickers,
+ * so every tile's clear wiped all the tiles before it and only the last one
+ * drawn survived -- stickers and decals were missing everywhere. */
+static void vk_eng_clear_rect_record(VkRenderPass rp, VkFramebuffer fb, u32 fw, u32 fh,
+                                     VkImage img, VkImageAspectFlags barrier_aspect,
+                                     const VkClearAttachment* ca, u32 x, u32 y, u32 w, u32 h)
+{
+    const int batched = vk_eb_active();
+    if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) return;
+    vk_barrier_image(img, barrier_aspect, VK_IMAGE_LAYOUT_GENERAL);
+    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                  .renderPass = rp, .framebuffer = fb,
+                                  .renderArea = { { 0, 0 }, { fw, fh } } };
+    pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    VkClearRect cr = { { { (int32_t)x, (int32_t)y }, { w, h } }, 0, 1 };
+    pvkCmdClearAttachments(s_vk.cmd, 1, ca, 1, &cr);
+    pvkCmdEndRenderPass(s_vk.cmd);
+    if (batched) vk_eb_recorded();
+    else vk_submit_and_wait();
+}
+
+/* Clamp a rectangle to a w x h target; 0 when nothing is left. */
+static int vk_eng_clamp_rect(u32 tw, u32 th, u32* x, u32* y, u32* w, u32* h)
+{
+    if (*x >= tw || *y >= th || !*w || !*h) return 0;
+    if (*w > tw - *x) *w = tw - *x;
+    if (*h > th - *y) *h = th - *y;
+    return 1;
+}
+
+static void vk_eng_clear_color_rect(void* user, u32 surface, const float rgba[4],
+                                    u32 x, u32 y, u32 w, u32 h)
+{
+    vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+    if (!o || !vk_eng_clamp_rect(o->w, o->h, &x, &y, &w, &h)) return;
+    if (x == 0 && y == 0 && w == o->w && h == o->h) { vk_eng_clear_color(user, surface, rgba); return; }
+    s_vk.clear_argb = ((u32)(rgba[3] * 255.0f + 0.5f) << 24) |
+                      ((u32)(rgba[0] * 255.0f + 0.5f) << 16) |
+                      ((u32)(rgba[1] * 255.0f + 0.5f) <<  8) |
+                       (u32)(rgba[2] * 255.0f + 0.5f);
+    /* Before any recording: the scratch depth may be (re)created, which
+     * submits on its own. */
+    VkImageView dview = vk_eng_scratch_depth(o->w, o->h);
+    VkRenderPass rp = vk_eng_render_pass(o->fmt, 1);
+    VkFramebuffer fb = (dview && rp)
+        ? vk_eng_framebuffer(rp, &surface, 1, dview, 0xFFFFFFFFu, o->w, o->h) : VK_NULL_HANDLE;
+    if (!fb) {
+        static int logged;
+        if (!logged++) VK_LOG("engine: rect clear unavailable for format %d, clearing the whole target\n",
+                              (int)o->fmt);
+        vk_eng_clear_color(user, surface, rgba);
+        return;
+    }
+    VkClearAttachment ca = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 0 };
+    memcpy(ca.clearValue.color.float32, rgba, sizeof ca.clearValue.color.float32);
+    vk_eng_clear_rect_record(rp, fb, o->w, o->h, o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, &ca, x, y, w, h);
+}
+
+/* A render pass with the depth attachment alone, for a depth rect clear. */
+static VkRenderPass vk_eng_depth_only_pass(void)
+{
+    static VkRenderPass rp;
+    if (rp) return rp;
+    VkAttachmentDescription att = {
+        .format = s_vk.depth_format, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkAttachmentReference dref = { 0, VK_IMAGE_LAYOUT_GENERAL };
+    VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                 .colorAttachmentCount = 0, .pDepthStencilAttachment = &dref };
+    VkRenderPassCreateInfo rci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+                                   .attachmentCount = 1, .pAttachments = &att,
+                                   .subpassCount = 1, .pSubpasses = &sub };
+    if (pvkCreateRenderPass(s_vk.device, &rci, NULL, &rp) != VK_SUCCESS) rp = VK_NULL_HANDLE;
+    return rp;
+}
+
+static void vk_eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags,
+                                            float depth_value, u8 stencil,
+                                            u32 x, u32 y, u32 w, u32 h)
+{
+    vk_eng_obj* o = vk_eng_get(depth, VK_ENG_DEPTH);
+    VkImageAspectFlags aspect = 0;
+    if (flags & RSX_BE_CLEAR_DEPTH) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (flags & RSX_BE_CLEAR_STENCIL) aspect |= s_vk.depth_aspect & VK_IMAGE_ASPECT_STENCIL_BIT;
+    if (!o || !aspect || !vk_eng_clamp_rect(o->w, o->h, &x, &y, &w, &h)) return;
+    if (x == 0 && y == 0 && w == o->w && h == o->h) {
+        vk_eng_clear_depth_stencil(user, depth, flags, depth_value, stencil);
+        return;
+    }
+    VkRenderPass rp = vk_eng_depth_only_pass();
+    /* No colour attachments: the cache key's colour slots are all 0, which no
+     * colour framebuffer has (handles start at 1). */
+    VkFramebuffer fb = rp ? vk_eng_framebuffer(rp, NULL, 0, o->im.view, depth, o->w, o->h)
+                          : VK_NULL_HANDLE;
+    if (!fb) { vk_eng_clear_depth_stencil(user, depth, flags, depth_value, stencil); return; }
+    VkClearAttachment ca = { .aspectMask = aspect };
+    ca.clearValue.depthStencil.depth = depth_value;
+    ca.clearValue.depthStencil.stencil = stencil;
+    vk_eng_clear_rect_record(rp, fb, o->w, o->h, o->im.img, s_vk.depth_aspect, &ca, x, y, w, h);
+}
+
 static int vk_eng_ensure_indices(VkDeviceSize bytes)
 {
     if (s_e2.indices.buf && s_e2.indices.size >= bytes) return 0;
@@ -3924,6 +4034,8 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .draw                 = vk_eng_draw,
     .clear_color          = vk_eng_clear_color,
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
+    .clear_color_rect     = vk_eng_clear_color_rect,
+    .clear_depth_stencil_rect = vk_eng_clear_depth_stencil_rect,
     .present              = vk_eng_present,
     .readback             = vk_eng_readback,
     .depth_readback       = vk_eng_depth_readback,
