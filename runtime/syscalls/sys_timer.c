@@ -134,9 +134,16 @@ static void write_be64(uint32_t addr, uint64_t val)
  *
  * r3 = microseconds
  * -----------------------------------------------------------------------*/
+/* PS3_POLLTOP "in loop" time per site: the real time of each sleep plus the gap
+ * since the same site's previous call returned when that gap is under 5 ms, i.e.
+ * the wall time the thread spent in that poll loop, check code included. A
+ * usleep(0) spin sleeps for nothing, so only this column shows what it costs. */
+static unsigned long long s_pt_loop_us[128], s_pt_last_end[128];
+
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
+    int pt_slot = -1; unsigned long long pt_t0 = 0;
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     { extern unsigned long long ps3_qpc_us(void);
       static int n=0; if (PS3_LOG_FIRST(n, 60))
@@ -179,6 +186,11 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         if (i < PT_MAX) { pt_n[i]++; pt_us[i] += usec; }
         { extern unsigned long long ps3_qpc_us(void);
           unsigned long long now = ps3_qpc_us();
+          if (i < PT_MAX) {
+              pt_slot = i; pt_t0 = now;
+              if (s_pt_last_end[i] && now - s_pt_last_end[i] < 5000)
+                  s_pt_loop_us[i] += now - s_pt_last_end[i];
+          }
           if (!pt_win) pt_win = now;
           else if (now - pt_win >= (unsigned long long)s_pt * 1000000ull) {
             fprintf(stderr, "--- usleep poll sites (last %lds) ---\n", s_pt);
@@ -187,13 +199,13 @@ int64_t sys_timer_usleep(ppu_context* ctx)
               for (int j = 0; j < pt_used; j++)
                 if (pt_n[j] && (best < 0 || pt_n[j] > pt_n[best])) best = j;
               if (best < 0) break;
-              fprintf(stderr, "  %8u calls  %6llums slept  tid=%-3u lr=0x%08X\n",
+              fprintf(stderr, "  %8u calls  %6llums slept  %6llums in loop  tid=%-3u lr=0x%08X\n",
                       pt_n[best], (unsigned long long)(pt_us[best] / 1000),
-                      pt_tid[best], pt_lr[best]);
+                      s_pt_loop_us[best] / 1000, pt_tid[best], pt_lr[best]);
               pt_n[best] = 0;
             }
             fflush(stderr);
-            for (int j = 0; j < pt_used; j++) { pt_n[j] = 0; pt_us[j] = 0; }
+            for (int j = 0; j < pt_used; j++) { pt_n[j] = 0; pt_us[j] = 0; s_pt_loop_us[j] = 0; }
             pt_win = now;
           } } } }
 
@@ -283,6 +295,12 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         nanosleep(&ts, NULL);
     }
 #endif
+    if (pt_slot >= 0) {
+        extern unsigned long long ps3_qpc_us(void);
+        unsigned long long t1 = ps3_qpc_us();
+        s_pt_loop_us[pt_slot] += t1 - pt_t0;
+        s_pt_last_end[pt_slot] = t1;
+    }
 
     return CELL_OK;
 }
