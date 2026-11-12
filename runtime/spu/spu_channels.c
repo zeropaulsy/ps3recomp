@@ -1837,8 +1837,8 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
  *    same address starts with id 0 and takes a fresh one.
  * A verified slot is not re-compared, as without the cache (verify once per
  * load); a store by SPU code into a verified span is not tracked, the same as
- * there. Misses (NULL) are not cached, so a rejected or unlifted target is
- * resolved every time, as before. SPU_DISPATCH_CACHE=shadow runs the full
+ * there. Misses (NULL) are cached too, in a separate table under the same keys
+ * (the interpreter's per-step rejoin check). SPU_DISPATCH_CACHE=shadow runs the full
  * resolver on every hit, counts disagreements and returns its answer. */
 typedef struct {
     spu_lifted_fn fn;
@@ -1853,6 +1853,14 @@ typedef struct {
 static SPU_TLS spu_dcache_ent t_dcache[SPU_DCACHE_ENTRIES];
 static uint32_t s_dcache_next_id;
 static unsigned long long s_dcache_hits, s_dcache_misses, s_dcache_shadow_bad;
+/* Cached misses (see spu_lifted_lookup), same keys as spu_dcache_ent. */
+typedef struct {
+    uint32_t id, lsa, rgen, residency;
+    int image, ovl, task;
+    int valid;
+} spu_dcache_neg;
+#define SPU_DCACHE_NEG_ENTRIES 1024u
+static SPU_TLS spu_dcache_neg t_dcache_neg[SPU_DCACHE_NEG_ENTRIES];
 static int spu_dcache_mode(void)   /* 0 off, 1 on, 2 shadow */
 {
     static int s_mode = -1;
@@ -1912,8 +1920,33 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         __atomic_fetch_add(&s_dcache_misses, 1, __ATOMIC_RELAXED);
         spu_dcache_shadow_stats();
     }
+    /* Negative entries: the interpreter asks before EVERY step whether it can
+     * rejoin lifted code, and in code with no lift (FMOD DSP plugins) that was
+     * a full resolution per instruction, about a third of the mixer thread. A
+     * miss depends on the same inputs as a hit (a rejected or pending slot is
+     * decided once per residency), so it is keyed the same way. A separate
+     * table keeps interpreted spans from evicting the hits. */
+    spu_dcache_neg* ng = &t_dcache_neg[((lsa >> 2) ^ (id * 0x9E3779B1u)) & (SPU_DCACHE_NEG_ENTRIES - 1)];
+    if (ng->valid && ng->id == id && ng->lsa == lsa && ng->rgen == rgen &&
+        ng->residency == c->dcache_residency && ng->image == c->image_id &&
+        ng->ovl == c->resident_ovl && ng->task == c->resident_task) {
+        if (mode != 2) return NULL;
+        const spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa, NULL);
+        if (!full) return NULL;
+        if (__atomic_fetch_add(&s_dcache_shadow_bad, 1, __ATOMIC_RELAXED) < 16)
+            fprintf(stderr, "[spu-dcache] shadow mismatch (negative) img=%d ovl=%d task=%d "
+                    "lsa=0x%05X full=%p\n", c->image_id, c->resident_ovl, c->resident_task,
+                    lsa, (void*)full);
+        ng->valid = 0;
+        return full;
+    }
     int reloc = 0;
     const spu_lifted_fn fn = spu_lifted_lookup_full(ctx, lsa, &reloc);
+    if (!fn) {
+        ng->valid = 1; ng->id = id; ng->lsa = lsa; ng->rgen = rgen;
+        ng->residency = c->dcache_residency; ng->image = c->image_id;
+        ng->ovl = c->resident_ovl; ng->task = c->resident_task;
+    }
     if (fn) {
         /* The resolver may have verified a pending slot; the entry records the
          * residency it resolved against, read after it. */
