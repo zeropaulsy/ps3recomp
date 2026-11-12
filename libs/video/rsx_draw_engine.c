@@ -839,10 +839,72 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
  * vtable path's target_for binds by. Resolution stops at the first member
  * that cannot be created, as that path stops at the first gap. Returns how
  * many were resolved, or 0. */
+/* RSX_ENGINE_WATCH=<offset hex>,<size hex>: log every draw or clear whose
+ * colour target A..D (local memory) starts inside that range of local memory,
+ * one line per change of target/clip/scissor/viewport with the number of calls
+ * since the last line, and (eng_watch_texture) how texture binds of exactly
+ * <offset> are served. Finds how a title fills an atlas it samples as one big
+ * texture: by drawing into the atlas surface itself, or into targets at
+ * offsets inside it that the texture lookup (exact address) never sees. */
+static int eng_watch_range(u32* lo, u32* hi)
+{
+    static int init; static u32 wlo, whi;
+    if (!init) {
+        init = 1;
+        const char* e = getenv("RSX_ENGINE_WATCH");
+        if (e && *e) {
+            char* d;
+            wlo = (u32)strtoul(e, &d, 16);
+            const u32 sz = (*d == ',') ? (u32)strtoul(d + 1, NULL, 16) : 0x1000000u;
+            whi = wlo + sz;
+        }
+    }
+    *lo = wlo; *hi = whi;
+    return whi > wlo;
+}
+
+static void eng_watch_targets(const rsx_dsp_surface* sf)
+{
+    u32 lo, hi;
+    if (!eng_watch_range(&lo, &hi)) return;
+    int hit = -1;
+    for (u32 i = 0; i < 4; i++)
+        if (sf->color_location[i] == RSX_LOCATION_LOCAL &&
+            sf->color_offset[i] >= lo && sf->color_offset[i] < hi) { hit = (int)i; break; }
+    if (hit < 0) return;
+    static u32 last[8]; static u32 calls, lines;
+    const u32 key[8] = { sf->color_offset[hit], sf->color_pitch[hit],
+                         sf->clip_w | (sf->clip_h << 16), sf->color_format | (sf->color_target << 8),
+                         rsx_dsp_reg(&g.rsx, 0x08C0), rsx_dsp_reg(&g.rsx, 0x08C4),
+                         rsx_dsp_reg(&g.rsx, 0x0A00), rsx_dsp_reg(&g.rsx, 0x0A04) };
+    calls++;
+    /* RSX_ENGINE_WATCH_TRIGGER=<n>: at the n-th watched call, create the
+     * RSX_ENGINE_PASS_DUMP_TRIGGER file, so the pass dump (which checks for
+     * it once a second) captures what is drawn into the watched range. */
+    { static long trig_at = -2;
+      if (trig_at == -2) { const char* e = getenv("RSX_ENGINE_WATCH_TRIGGER"); trig_at = e ? atol(e) : -1; }
+      const char* tf = getenv("RSX_ENGINE_PASS_DUMP_TRIGGER");
+      if (trig_at > 0 && (long)calls == trig_at && tf && *tf) {
+          FILE* f = fopen(tf, "w");
+          if (f) fclose(f);
+          fprintf(stderr, "[rsx watch] frame %u call %u: pass dump trigger %s created\n", g.frames, calls, tf);
+      } }
+    if (!memcmp(key, last, sizeof key) || lines >= 4000) return;
+    memcpy(last, key, sizeof key);
+    lines++;
+    fprintf(stderr, "[rsx watch] frame %u calls %u: target %c 0x%08X pitch %u clip %ux%u at %u,%u"
+                    " cfmt %u rt_sel %u scissor x %u+%u y %u+%u viewport x %u+%u y %u+%u\n",
+            g.frames, calls, 'A' + hit, key[0], key[1], sf->clip_w, sf->clip_h, sf->clip_x, sf->clip_y,
+            sf->color_format, sf->color_target,
+            key[4] & 0xFFFFu, key[4] >> 16, key[5] & 0xFFFFu, key[5] >> 16,
+            key[6] & 0xFFFFu, key[6] >> 16, key[7] & 0xFFFFu, key[7] >> 16);
+}
+
 static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
 {
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
+    eng_watch_targets(&sf);
     /* SET_SURFACE_COLOR_TARGET 2 selects B alone; every other value starts at
      * A, and the MRT selectors add B, C and D on top of it. */
     const u32 sel = (sf.color_target == CELL_GCM_SURFACE_TARGET_1) ? 1u : 0u;
@@ -2730,6 +2792,32 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
          * aliased surface a store to guest memory, for nothing. */
         if (!t.enabled || !((tex_used >> u) & 1u)) continue;
         mask |= 1u << u;
+        { u32 wlo, whi;
+          static u32 last_frame = ~0u;
+          if (eng_watch_range(&wlo, &whi) && t.location == RSX_LOCATION_LOCAL && t.offset == wlo &&
+              (last_frame == ~0u || g.frames - last_frame >= 300u)) {
+              last_frame = g.frames;
+              int surf = -1;
+              for (u32 i = 0; i < g.n_surfaces; i++)
+                  if (g.surfaces[i].handle && g.surfaces[i].location == t.location &&
+                      g.surfaces[i].offset == t.offset) { surf = (int)i; break; }
+              const u32 span = t.pitch ? t.pitch * t.height : t.width * t.height * 4u;
+              const u8* p = eng_guest_ptr(NULL, t.location, t.offset, span);
+              u32 nz = 0, rows_nz = 0;
+              if (p) for (u32 y = 0; y < t.height; y++) {
+                  u32 rn = 0;
+                  const u8* row = p + (size_t)y * (t.pitch ? t.pitch : t.width * 4u);
+                  for (u32 x = 0; x < t.width * 4u; x++) rn += row[x] != 0;
+                  nz += rn; rows_nz += rn != 0;
+              }
+              fprintf(stderr, "[rsx watch] frame %u tex unit %u 0x%08X fmt 0x%02X %ux%u pitch %u: %s%d"
+                              " (surface %ux%u serial %u, guest_dirty %d); guest bytes nonzero %u, rows %u\n",
+                      g.frames, u, t.offset, t.format, t.width, t.height, t.pitch,
+                      surf >= 0 ? "surface slot " : "no surface ", surf,
+                      surf >= 0 ? g.surfaces[surf].w : 0u, surf >= 0 ? g.surfaces[surf].h : 0u,
+                      surf >= 0 ? (u32)g.surfaces[surf].color_serial : 0u,
+                      surf >= 0 ? (int)g.surfaces[surf].guest_dirty : 0, nz, rows_nz);
+          } }
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
         samplers[u].border = eng_border_class(t.format, t.border_color);
 
@@ -3476,6 +3564,138 @@ static void sink_end(void* user, const rsx_dispatch* r)
       alpha[2] = ((win >> 16) & 0xFu) ? -0.5f : 0.0f;
       alpha[3] = 0.0f;
       if (s_dbz.unit) { alpha[4] = s_dbz.mn; alpha[5] = s_dbz.mx; alpha[6] = alpha[7] = 0.0f; } }
+
+    /* RSX_ENGINE_CONSTDUMP_FP=<hex>[:<max draws>]: for draws through that
+     * fragment program (default the first 64), print the vertex program's
+     * transform constants 0..15 and every buffered fragment constant as floats,
+     * so a material colour the VP copies from a constant into col0 can be read
+     * directly instead of inferred from the final pixel. */
+    {
+        static int cd_init; static u64 cd_hash; static long cd_left;
+        if (!cd_init) {
+            cd_init = 1;
+            const char* e = getenv("RSX_ENGINE_CONSTDUMP_FP");
+            if (e && *e) {
+                char* d;
+                cd_hash = strtoull(e, &d, 16);
+                cd_left = (*d == ':') ? strtol(d + 1, NULL, 10) : 64;
+            }
+        }
+        if (cd_hash && fp_hash == cd_hash && cd_left > 0) {
+            cd_left--;
+            fprintf(stderr, "[rsx constdump] fp %016llx pipe %u frame %u\n",
+                    (unsigned long long)fp_hash, pipeline, g.frames);
+            for (u32 c = 0; c < 16u; c++) {
+                float v[4]; memcpy(v, g.rsx.constants[c], sizeof v);
+                fprintf(stderr, "[rsx constdump]  vc%-3u %g %g %g %g\n", c, v[0], v[1], v[2], v[3]);
+            }
+            for (u32 c = 0; c < g.fp_constants.count; c++) {
+                float v[4]; memcpy(v, g.fp_constants.values[c], sizeof v);
+                fprintf(stderr, "[rsx constdump]  fc%-3u %g %g %g %g\n", c, v[0], v[1], v[2], v[3]);
+            }
+            /* The vertex inputs: each attribute's array format/offset
+             * registers and its decoded value in the first vertices. */
+            fprintf(stderr, "[rsx constdump]  verts %u inline_bytes %u immediate %u fetch_ok %d stride %u\n",
+                    dc.n_verts, dc.inl_bytes, dc.n_immediate, dc.fetch_ok, dc.layout.stride);
+            for (u32 k = 0; k < dc.layout.count; k++) {
+                const u32 a = dc.layout.attrs[k];
+                const u32 fmt = rsx_dsp_reg(&g.rsx, 0x1740u + a * 4u);
+                const u32 off = rsx_dsp_reg(&g.rsx, 0x1680u + a * 4u);
+                fprintf(stderr, "[rsx constdump]  attr%u fmt 0x%08X (type %u size %u stride %u) off 0x%08X:",
+                        a, fmt, fmt & 0xFu, (fmt >> 4) & 0xFu, (fmt >> 8) & 0xFFu, off);
+                for (u32 v = 0; v < dc.n_verts && v < 4u && dc.verts; v++) {
+                    float f[4]; memcpy(f, dc.verts + (size_t)v * dc.layout.stride + k * 16u, sizeof f);
+                    fprintf(stderr, " (%g %g %g %g)", f[0], f[1], f[2], f[3]);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+
+    /* RSX_ENGINE_TEXDUMP=<dir>,<units mask hex>,<required mask hex>: at the
+     * first draw every 100 frames (20 at most) whose program samples every
+     * unit of the required mask, write each sampled unit of the units mask:
+     * <dir>/tex_u<unit>_f<frame>.pam (RGBA with alpha) and one .txt with the
+     * registers. A unit whose address holds an engine colour surface is read
+     * back from the GPU (an atlas the title renders), anything else is level 0
+     * decoded from guest memory as the engine uploads it (before the sampler's
+     * remap). Checks a lookup table and the atlas it indexes in one frame. */
+    {
+        static int td_init; static char td_dir[512]; static u32 td_units, td_need, td_last = ~0u, td_n;
+        if (!td_init) {
+            td_init = 1;
+            const char* e = getenv("RSX_ENGINE_TEXDUMP");
+            if (e && *e) {
+                const char* c1 = strchr(e, ',');
+                if (c1) {
+                    snprintf(td_dir, sizeof td_dir, "%.*s", (int)(c1 - e), e);
+                    char* d;
+                    td_units = (u32)strtoul(c1 + 1, &d, 16);
+                    td_need = (*d == ',') ? (u32)strtoul(d + 1, NULL, 16) : 0u;
+                }
+            }
+        }
+        if (td_dir[0] && td_n < 20 && (tex_used & td_need) == td_need && (tex_used & td_units) &&
+            (td_last == ~0u || g.frames - td_last >= 100u)) {
+            td_last = g.frames;
+            td_n++;
+            char path[700];
+            snprintf(path, sizeof path, "%s/tex_f%u.txt", td_dir, g.frames);
+            FILE* info = fopen(path, "w");
+            if (info) fprintf(info, "frame %u fp %016llx pipe %u\n", g.frames,
+                              (unsigned long long)fp_hash, pipeline);
+            for (u32 u = 0; u < 16; u++) {
+                if (!((td_units >> u) & 1u) || !((tex_used >> u) & 1u)) continue;
+                rsx_dsp_texture t;
+                rsx_dsp_get_texture(&g.rsx, u, &t);
+                int surf = -1;
+                for (u32 i = 0; i < g.n_surfaces; i++)
+                    if (g.surfaces[i].handle && g.surfaces[i].location == t.location &&
+                        g.surfaces[i].offset == t.offset) { surf = (int)i; break; }
+                u32 w = 0, h = 0;
+                u8* rgba = NULL;
+                const char* how = "none";
+                if (surf >= 0 && g.surfaces[surf].fmt == RSX_BE_FMT_R8G8B8A8 && g.be->readback) {
+                    w = g.surfaces[surf].w; h = g.surfaces[surf].h;
+                    rgba = (u8*)calloc((size_t)w * h, 4u);
+                    if (rgba) {
+                        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+                        g.be->readback(g.be->user, g.surfaces[surf].handle, 0, 0, w, h, rgba, w * 4u);
+                        how = "surface readback";
+                    }
+                } else if (surf < 0) {
+                    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+                    const u32 nlv = rsx_texture_mip_chain(t.format, t.width, t.height, t.mipmaps, t.pitch, lv);
+                    const u32 span = eng_texture_span(t.format, t.width, t.height, t.mipmaps, t.pitch, 0);
+                    const u8* src = nlv ? eng_guest_linear(t.location, t.offset, span) : NULL;
+                    if (src && lv[0].tl.dst_bytes_per_texel == 4u) {
+                        w = lv[0].w; h = lv[0].h;
+                        rgba = (u8*)malloc((size_t)lv[0].tl.dst_row_bytes * lv[0].tl.rows);
+                        if (rgba) {
+                            rsx_texture_decode(rgba, lv[0].tl.dst_row_bytes, src + lv[0].offset,
+                                               w, h, &lv[0].tl, rsx_texture_argb_is_rgba());
+                            how = "guest decode";
+                        }
+                    }
+                }
+                if (info) fprintf(info, "unit %u loc %u offset 0x%08X fmt 0x%02X %ux%u mips %u pitch %u"
+                                        " remap 0x%08X filter 0x%08X: %s %ux%u\n",
+                                  u, t.location, t.offset, t.format, t.width, t.height, t.mipmaps,
+                                  t.pitch, t.remap, t.filter, how, w, h);
+                if (rgba) {
+                    snprintf(path, sizeof path, "%s/tex_u%u_f%u.pam", td_dir, u, g.frames);
+                    FILE* f = fopen(path, "wb");
+                    if (f) {
+                        fprintf(f, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", w, h);
+                        fwrite(rgba, 1, (size_t)w * h * 4u, f);
+                        fclose(f);
+                    }
+                    free(rgba);
+                }
+            }
+            if (info) fclose(info);
+        }
+    }
 
     pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
 
