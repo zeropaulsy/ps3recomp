@@ -34,6 +34,10 @@
  *                             order) instead of the first non-CPU device.
  *   PS3RECOMP_VK_DUMP=<path>  write every presented frame to <path> as a
  *                             binary PPM (overwritten each present).
+ *   PS3RECOMP_VK_SEQ_DIR=<dir> also write every present, half size, as
+ *                             <dir>/pNNNNNN_tSSSS.SS.ppm (the dir must exist);
+ *                             PS3RECOMP_VK_SEQ_AFTER=<sec> starts it late,
+ *                             PS3RECOMP_VK_SEQ_MAX=<n> caps it (default 2000).
  *   PS3RECOMP_VK_WINDOW=1     also show each presented frame in an SDL2
  *                             window. Rendering and readback are unchanged, so
  *                             every test gives the same result with or without

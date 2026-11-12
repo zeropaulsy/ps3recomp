@@ -1446,6 +1446,43 @@ static int eng_staging_reserve(u32 bytes)
  * the backend. Returns the backend handle, or 0. `into`, when nonzero, is an
  * existing 2D texture of exactly this key to rewrite instead of creating one
  * (rsx_draw_backend.texture_upload_ordered). */
+/* RSX_ENGINE_UPLOAD_LOG=<after seconds>: once the run is that old, one line
+ * per texture upload out of guest memory (a new cache entry or a re-upload
+ * after its bytes changed): CLOCK_MONOTONIC time, engine frame, address,
+ * size, format, and the share of all-zero 32-bit words in its bytes overall
+ * and per eighth of its rows. Finds a texture a producer (SPU, CPU) left
+ * partly written when the RSX sampled it. */
+static void eng_upload_log(u32 location, u32 offset, u32 fmt, u32 w, u32 h, u32 pitch,
+                           u32 span, int fresh_entry)
+{
+    static int on = -1; static double after, t0;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const double now = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+    if (on < 0) {
+        const char* e = getenv("RSX_ENGINE_UPLOAD_LOG");
+        on = (e && *e) ? 1 : 0; after = e ? atof(e) : 0.0; t0 = now;
+    }
+    if (!on || now - t0 < after || !span) return;
+    const u8* src = eng_guest_ptr(NULL, location, offset, span);
+    if (!src) return;
+    u32 words = span / 4u, zero = 0, band[8] = { 0 }, bandn[8] = { 0 };
+    const u32 rowb = pitch ? pitch : span / (h ? h : 1u);
+    for (u32 i = 0; i < words; i++) {
+        u32 v; memcpy(&v, src + (size_t)i * 4u, 4);
+        const u32 row = rowb ? (i * 4u) / rowb : 0u;
+        const u32 b = h ? (row * 8u / h) : 0u;
+        if (b < 8) { bandn[b]++; if (!v) band[b]++; }
+        if (!v) zero++;
+    }
+    char bands[64]; int k = 0;
+    for (u32 b = 0; b < 8; b++)
+        k += snprintf(bands + k, sizeof bands - (size_t)k, "%s%u", b ? "," : "",
+                      bandn[b] ? band[b] * 100u / bandn[b] : 0u);
+    fprintf(stderr, "[upl] t %.3f f %u %s %u:0x%08X %ux%u fmt 0x%02X pitch %u zero %u%% bands %s\n",
+            now, g.frames, fresh_entry ? "new" : "chg", location, offset, w, h, fmt & 0xFFu,
+            pitch, words ? zero * 100u / words : 0u, bands);
+}
+
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               u32 levels, u32 pitch, int cube, u32 remap, u32 depth,
                               u32 into)
@@ -1604,6 +1641,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                  * and the levels to upload would not all exist). */
                 const u32 into = (g.be->texture_upload_ordered && depth <= 1 &&
                                   e->levels == levels) ? e->handle : 0u;
+                eng_upload_log(location, offset, fmt, w, h, pitch, span, 0);
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                      levels, pitch, cube, remap, depth, into);
                 if (fresh && !into) {
@@ -1641,6 +1679,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     { int readable = 0;
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable);
       e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable); }
+    eng_upload_log(location, offset, fmt, w, h, pitch, span, 1);
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap, depth, 0u);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
@@ -3328,6 +3367,91 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
 /* Called on every present: arm on the first frame heavy enough when no delay
  * was asked for, and while capturing, close the pass in progress and write
  * the presented surface. */
+/* RSX_ENGINE_ROWPROBE=<after seconds>[,<y>]: once the run is that old, at the
+ * end of every pass read back ONE row of each RGBA8 colour target at least
+ * 640 wide (row y of a 720-high frame, scaled to the target; default 470) and
+ * log the pass when that row holds 5 or more black runs of 1/32..1/20 of the
+ * width, or is 95 % black. Much lighter than the pass dump (one small
+ * readback per pass, no files), for a glitch the pass dump's slowdown hides:
+ * it names the first pass a one-frame pattern of black bars appears in. */
+static struct { int on; double after, t0; u32 y; u32 n, targets[RSX_BE_MAX_COLOR_TARGETS]; u32 pass; u32 frame; u32 pipe, last_pipe; char ev[512], last_ev[512]; } s_rp = { .on = -1 };
+
+static void rp_check(u32 slot, u32 k)
+{
+    const eng_surface* s = &g.surfaces[slot];
+    if (!s->handle || s->fmt != RSX_BE_FMT_R8G8B8A8 || s->w < 640 || !s->h) return;
+    const u32 y = s->h * s_rp.y / 720u;
+    if (y >= s->h) return;
+    static u8* row; static u32 cap;
+    if (cap < s->w * 4u) { u8* n = (u8*)realloc(row, s->w * 4u); if (!n) return; row = n; cap = s->w * 4u; }
+    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    g.be->readback(g.be->user, s->handle, 0, y, s->w, 1, row, s->w * 4u);
+    u32 runs = 0, cur = 0, black = 0;
+    const u32 lo = s->w / 32u, hi = s->w / 20u;
+    char where[256]; int wn = 0; where[0] = 0;
+    for (u32 x = 0; x <= s->w; x++) {
+        const int b = x < s->w && (row[x * 4u] | row[x * 4u + 1] | row[x * 4u + 2]) <= 2;
+        if (b) { cur++; black++; continue; }
+        if (cur >= lo && cur <= hi) {
+            runs++;
+            if (wn < (int)sizeof where - 16) wn += snprintf(where + wn, sizeof where - (size_t)wn, " %u+%u", x - cur, cur);
+        }
+        cur = 0;
+    }
+    if (runs >= 5 || black * 100u >= s->w * 95u)
+        fprintf(stderr, "[rowprobe] t %.3f f %u pass %u pipe %u t%u 0x%08X %ux%u row %u: runs %u black %u%%%s | events%s\n",
+                s_rp.t0, g.frames, s_rp.pass, s_rp.last_pipe, k, s->offset, s->w, s->h, y, runs,
+                black * 100u / s->w, where, s_rp.last_ev);
+}
+
+/* One event of the current pass for the row probe's log: "d<pipe>" for a
+ * draw, "c<x>,<y>,<w>x<h>" for a clear with its scissor. */
+static void rp_event(u32 pipeline)
+{
+    if (s_rp.on != 1) return;
+    const size_t n = strlen(s_rp.ev);
+    if (n > sizeof s_rp.ev - 40) return;
+    if (pipeline) snprintf(s_rp.ev + n, sizeof s_rp.ev - n, " d%u", pipeline);
+    else {
+        const u32 h = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL), v = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+        snprintf(s_rp.ev + n, sizeof s_rp.ev - n, " c%u,%u,%ux%u", h & 0xFFFFu, v & 0xFFFFu, h >> 16, v >> 16);
+    }
+}
+
+static void rp_note(const u32* targets, u32 n_targets, u32 pipeline)
+{
+    if (s_rp.on < 0) {
+        const char* e = getenv("RSX_ENGINE_ROWPROBE");
+        s_rp.on = (e && *e) ? 1 : 0;
+        s_rp.after = e ? atof(e) : 0.0;
+        const char* c = e ? strchr(e, ',') : NULL;
+        s_rp.y = c ? (u32)atoi(c + 1) : 470u;
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        s_rp.t0 = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+        s_rp.after += s_rp.t0;
+    }
+    if (!s_rp.on || !g.be->readback) return;
+    int same = s_rp.n == n_targets;
+    for (u32 k = 0; same && k < n_targets; k++) same = s_rp.targets[k] == targets[k];
+    if (same) { if (pipeline) s_rp.pipe = pipeline; rp_event(pipeline); return; }
+    s_rp.last_pipe = s_rp.pipe;
+    s_rp.pipe = pipeline;
+    memcpy(s_rp.last_ev, s_rp.ev, sizeof s_rp.ev);
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const double now = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+    if (now >= s_rp.after) {
+        const double keep = s_rp.t0;
+        s_rp.t0 = now;   /* printed as the time of the check */
+        for (u32 k = 0; k < s_rp.n; k++) rp_check(s_rp.targets[k], k);
+        s_rp.t0 = keep;
+    }
+    if (s_rp.frame != g.frames) { s_rp.frame = g.frames; s_rp.pass = 0; } else s_rp.pass++;
+    s_rp.n = n_targets;
+    memcpy(s_rp.targets, targets, n_targets * sizeof(u32));
+    s_rp.ev[0] = 0;
+    rp_event(pipeline);
+}
+
 static void pd_present(u32 presented)
 {
     if (s_pd.state == 0) pd_capturing();
@@ -3585,6 +3709,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
             cd_left--;
             fprintf(stderr, "[rsx constdump] fp %016llx pipe %u frame %u\n",
                     (unsigned long long)fp_hash, pipeline, g.frames);
+            fprintf(stderr, "[rsx constdump]  viewport scale %g %g %g translate %g %g %g clip %ux%u aa %ux%u\n",
+                    vp.scale[0], vp.scale[1], vp.scale[2], vp.translate[0], vp.translate[1],
+                    vp.translate[2], sf.clip_w, sf.clip_h, sf.aa_sx, sf.aa_sy);
             for (u32 c = 0; c < 16u; c++) {
                 float v[4]; memcpy(v, g.rsx.constants[c], sizeof v);
                 fprintf(stderr, "[rsx constdump]  vc%-3u %g %g %g %g\n", c, v[0], v[1], v[2], v[3]);
@@ -3603,7 +3730,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
                 const u32 off = rsx_dsp_reg(&g.rsx, 0x1680u + a * 4u);
                 fprintf(stderr, "[rsx constdump]  attr%u fmt 0x%08X (type %u size %u stride %u) off 0x%08X:",
                         a, fmt, fmt & 0xFu, (fmt >> 4) & 0xFu, (fmt >> 8) & 0xFFu, off);
-                for (u32 v = 0; v < dc.n_verts && v < 4u && dc.verts; v++) {
+                static u32 cd_nv;
+                if (!cd_nv) { const char* e = getenv("RSX_ENGINE_CONSTDUMP_VERTS");
+                              cd_nv = (e && atoi(e) > 0) ? (u32)atoi(e) : 4u; }
+                for (u32 v = 0; v < dc.n_verts && v < cd_nv && dc.verts; v++) {
                     float f[4]; memcpy(f, dc.verts + (size_t)v * dc.layout.stride + k * 16u, sizeof f);
                     fprintf(stderr, " (%g %g %g %g)", f[0], f[1], f[2], f[3]);
                 }
@@ -3697,6 +3827,91 @@ static void sink_end(void* user, const rsx_dispatch* r)
         }
     }
 
+    /* RSX_ENGINE_TEXROW_FP=<hex>[:<y>]: for each draw through that fragment
+     * program, one line per sampled unit: where it comes from (S = colour
+     * surface at that exact address, with its serial; Z = a depth target
+     * written after it; G = guest memory) and statistics of one row (y of a
+     * 720-high frame, scaled; default 470): per-channel min/max, black and
+     * zero-alpha pixel counts, and runs of black / of zero alpha 1/32..1/20 of
+     * the width long. Tells whether a program's inputs already carry a
+     * pattern its output shows. */
+    {
+        static int tr_init; static u64 tr_hash; static u32 tr_y = 470u;
+        if (!tr_init) {
+            tr_init = 1;
+            const char* e = getenv("RSX_ENGINE_TEXROW_FP");
+            if (e && *e) { char* d; tr_hash = strtoull(e, &d, 16); if (*d == ':') tr_y = (u32)atoi(d + 1); }
+        }
+        if (tr_hash && fp_hash == tr_hash) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            for (u32 u = 0; u < 16; u++) {
+                if (!((tex_used >> u) & 1u)) continue;
+                rsx_dsp_texture t;
+                rsx_dsp_get_texture(&g.rsx, u, &t);
+                int surf = -1, zs = -1;
+                for (u32 i = 0; i < g.n_surfaces; i++)
+                    if (g.surfaces[i].handle && g.surfaces[i].location == t.location &&
+                        g.surfaces[i].offset == t.offset) { surf = (int)i; break; }
+                for (u32 i = 0; i < g.n_zdepths; i++)
+                    if (g.zdepths[i].location == t.location && g.zdepths[i].offset == t.offset &&
+                        g.zdepths[i].depth_serial &&
+                        (surf < 0 || g.zdepths[i].depth_serial > g.surfaces[surf].color_serial)) { zs = (int)i; break; }
+                u32 w = 0, h = 0;
+                u8* row = NULL;
+                char src = 'G';
+                if (zs >= 0) src = 'Z';
+                else if (surf >= 0 && g.surfaces[surf].fmt == RSX_BE_FMT_R8G8B8A8 && g.be->readback) {
+                    src = 'S';
+                    w = g.surfaces[surf].w; h = g.surfaces[surf].h;
+                    row = (u8*)malloc((size_t)w * 4u);
+                    if (row) {
+                        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+                        g.be->readback(g.be->user, g.surfaces[surf].handle, 0, h * tr_y / 720u, w, 1, row, w * 4u);
+                    }
+                } else if (surf >= 0) src = 's';
+                else {
+                    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+                    const u32 nlv = rsx_texture_mip_chain(t.format, t.width, t.height, 1, t.pitch, lv);
+                    const u32 span = eng_texture_span(t.format, t.width, t.height, 1, t.pitch, 0);
+                    const u8* gsrc = nlv ? eng_guest_linear(t.location, t.offset, span) : NULL;
+                    if (gsrc && lv[0].tl.dst_bytes_per_texel == 4u) {
+                        w = lv[0].w; h = lv[0].h;
+                        u8* all = (u8*)malloc((size_t)lv[0].tl.dst_row_bytes * lv[0].tl.rows);
+                        if (all) {
+                            rsx_texture_decode(all, lv[0].tl.dst_row_bytes, gsrc + lv[0].offset,
+                                               w, h, &lv[0].tl, rsx_texture_argb_is_rgba());
+                            row = (u8*)malloc((size_t)w * 4u);
+                            if (row) memcpy(row, all + (size_t)(h * tr_y / 720u) * lv[0].tl.dst_row_bytes, (size_t)w * 4u);
+                            free(all);
+                        }
+                    }
+                }
+                u32 mn[4] = { 255, 255, 255, 255 }, mx[4] = { 0, 0, 0, 0 }, black = 0, a0 = 0, rb = 0, ra = 0;
+                if (row) {
+                    u32 cb = 0, ca = 0;
+                    const u32 lo = w / 32u, hi = w / 20u;
+                    for (u32 x = 0; x <= w; x++) {
+                        int b = 0, az = 0;
+                        if (x < w) {
+                            const u8* q = row + (size_t)x * 4u;
+                            for (u32 c = 0; c < 4; c++) { if (q[c] < mn[c]) mn[c] = q[c]; if (q[c] > mx[c]) mx[c] = q[c]; }
+                            b = (q[0] | q[1] | q[2]) <= 2; az = q[3] < 8;
+                            black += b; a0 += az;
+                        }
+                        if (b) cb++; else { if (cb >= lo && cb <= hi) rb++; cb = 0; }
+                        if (az) ca++; else { if (ca >= lo && ca <= hi) ra++; ca = 0; }
+                    }
+                    free(row);
+                }
+                fprintf(stderr, "[texrow] t %.3f f %u u%u %c 0x%08X fmt 0x%02X %ux%u ser %u: min %u,%u,%u,%u max %u,%u,%u,%u black %u a0 %u runs %u/%u\n",
+                        (double)ts.tv_sec + ts.tv_nsec * 1e-9, g.frames, u, src, t.offset, t.format, w, h,
+                        surf >= 0 ? (u32)g.surfaces[surf].color_serial : 0u,
+                        mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3], black, a0, rb, ra);
+            }
+        }
+    }
+
+    rp_note(targets, n_targets, pipeline);
     pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
 
     /* The depth attachment is cleared the first time it is bound, so a title
@@ -3781,6 +3996,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
     if (!n_targets) return;
+    rp_note(targets, n_targets, 0);
     if (pd_capturing()) {
         rsx_dsp_surface zs;
         rsx_dsp_get_surface(&g.rsx, &zs);

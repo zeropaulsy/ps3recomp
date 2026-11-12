@@ -606,11 +606,78 @@ static const int s_valid_pitch_count = sizeof(s_valid_pitches) / sizeof(s_valid_
  * API implementations -- Initialization
  * -----------------------------------------------------------------------*/
 
+#ifndef _WIN32
+/* GCM_LABEL_POLL=<idx hex>[,<idx>...] (up to 8): a thread that reads those
+ * GCM labels every ~100 us and logs each change with ps3_ms_now time -- the
+ * write history of a label whatever writes it (PPU store, RSX release, SPU
+ * DMA), to put next to SPU_WRITE_WATCH and GCM_XFER_SYNC_LOG. */
+static u32 s_lp_idx[8]; static int s_lp_n;
+static void* gcm_label_poll_thread(void* arg)
+{
+    (void)arg;
+    extern unsigned long long ps3_ms_now(void);
+    u32 last[8];
+    for (int i = 0; i < s_lp_n; i++) last[i] = vm_read32(GCM_LABEL_GUEST_BASE + s_lp_idx[i] * 16u);
+    for (;;) {
+        for (int i = 0; i < s_lp_n; i++) {
+            const u32 v = vm_read32(GCM_LABEL_GUEST_BASE + s_lp_idx[i] * 16u);
+            if (v != last[i]) {
+                fprintf(stderr, "[lpoll] %llu ms label 0x%02X 0x%08X -> 0x%08X\n",
+                        ps3_ms_now(), s_lp_idx[i], last[i], v);
+                last[i] = v;
+            }
+        }
+        usleep(100);
+    }
+    return NULL;
+}
+/* MEM_POLL=<ea>[:<n bytes, <= 16>][,...] (up to 4 ranges): the same thread
+ * also logs every change of those guest bytes ([mpoll], hex dump old -> new). */
+static u32 s_mp_ea[4], s_mp_n[4]; static int s_mp_cnt;
+static void* gcm_mem_poll_thread(void* arg)
+{
+    (void)arg;
+    extern u8* vm_base;
+    extern unsigned long long ps3_ms_now(void);
+    u8 last[4][16];
+    for (int i = 0; i < s_mp_cnt; i++) for (u32 j = 0; j < s_mp_n[i]; j++) last[i][j] = vm_base[s_mp_ea[i] + j];
+    for (;;) {
+        for (int i = 0; i < s_mp_cnt; i++) {
+            u8 cur[16]; int ch = 0;
+            for (u32 j = 0; j < s_mp_n[i]; j++) { cur[j] = vm_base[s_mp_ea[i] + j]; if (cur[j] != last[i][j]) ch = 1; }
+            if (!ch) continue;
+            char o[64], n[64]; int k = 0, m = 0;
+            for (u32 j = 0; j < s_mp_n[i]; j++) { k += snprintf(o + k, sizeof o - k, "%02X", last[i][j]);
+                                                   m += snprintf(n + m, sizeof n - m, "%02X", cur[j]); last[i][j] = cur[j]; }
+            fprintf(stderr, "[mpoll] %llu ms 0x%08X %s -> %s\n", ps3_ms_now(), s_mp_ea[i], o, n);
+        }
+        usleep(100);
+    }
+    return NULL;
+}
+static void gcm_label_poll_start(void)
+{
+    { extern u8* vm_base; (void)vm_base; const char* m = getenv("MEM_POLL");
+      while (m && *m && s_mp_cnt < 4) { char* d; s_mp_ea[s_mp_cnt] = (u32)strtoul(m, &d, 16); s_mp_n[s_mp_cnt] = 4;
+          if (*d == ':') s_mp_n[s_mp_cnt] = (u32)strtoul(d + 1, &d, 0);
+          if (s_mp_n[s_mp_cnt] < 1 || s_mp_n[s_mp_cnt] > 16) s_mp_n[s_mp_cnt] = 4;
+          s_mp_cnt++; m = (*d == ',') ? d + 1 : NULL; }
+      if (s_mp_cnt) { pthread_t t; if (pthread_create(&t, NULL, gcm_mem_poll_thread, NULL) == 0) pthread_detach(t); } }
+    const char* e = getenv("GCM_LABEL_POLL");
+    while (e && *e && s_lp_n < 8) { char* d; s_lp_idx[s_lp_n++] = (u32)strtoul(e, &d, 16) & 0xFFu;
+                                    e = (*d == ',') ? d + 1 : NULL; }
+    if (s_lp_n) { pthread_t t; if (pthread_create(&t, NULL, gcm_label_poll_thread, NULL) == 0) pthread_detach(t); }
+}
+#endif
+
 /* NID: 0xB2E761D4 */
 s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
 {
     printf("[cellGcmSys] Init(cmdSize=0x%X, ioSize=0x%X, ioAddr=0x%08X)\n",
            cmdSize, ioSize, ioAddress);
+#ifndef _WIN32
+    { static int lp_started; if (!lp_started) { lp_started = 1; gcm_label_poll_start(); } }
+#endif
 
     if (s_gcm_initialized) {
         printf("[cellGcmSys] WARNING: already initialized\n");
@@ -1011,6 +1078,18 @@ static DWORD WINAPI gcm_intr_main(LPVOID unused)
 static void* gcm_intr_posix(void* a) { gcm_intr_main(a); return NULL; }
 #endif
 
+/* GCM_UCMD_LOG=<after s>: each user command when the FIFO consumer retires
+ * it ([ucmd] retire, with the FIFO get) and when the guest handler is called
+ * ([ucmd] deliver), on the ps3_ms_now clock. */
+static int gcm_ucmd_log_on(void)
+{
+    static int on = -1; static unsigned long long t;
+    extern unsigned long long ps3_ms_now(void);
+    if (on < 0) { const char* e = getenv("GCM_UCMD_LOG"); on = e ? 1 : 0;
+                  t = ps3_ms_now() + (e ? (unsigned long long)(atof(e) * 1000.0) : 0ull); }
+    return on && ps3_ms_now() >= t;
+}
+
 void ppu_gcm_pump(void)
 {
     /* Every HLE call and timer sleep pumps, tens of thousands of times a
@@ -1077,8 +1156,13 @@ void ppu_gcm_pump(void)
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
     }
     for (unsigned i = 0; i < nub; i++)
-        if (s_user_handler_opd && g_ps3_guest_caller)
+        if (s_user_handler_opd && g_ps3_guest_caller) {
+            if (gcm_ucmd_log_on()) { extern unsigned long long ps3_ms_now(void);
+                fprintf(stderr, "[ucmd] %llu ms deliver 0x%08X (batch %u/%u)\n", ps3_ms_now(), ubatch[i], i + 1, nub); }
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)ubatch[i], 0, 0, 0, 0, 0, 0, 0);
+            if (gcm_ucmd_log_on()) { extern unsigned long long ps3_ms_now(void);
+                fprintf(stderr, "[ucmd] %llu ms handled 0x%08X\n", ps3_ms_now(), ubatch[i]); }
+        }
     GCM_PUMP_LEAVE();
 }
 
@@ -1282,6 +1366,79 @@ static inline u64 nv3089_origin(u32 p) { return (u64)p << 16; }
  * engine's surfaces. Around the guest-memory copy below: write the source
  * rectangle back from any engine surface first, and push the written
  * rectangle into any engine surface after. 32-bit pixels only. */
+/* GCM_XFER_SYNC_LOG=<n>: for the first n NV3089 copies, log the source and
+ * destination and the last semaphore acquire the RSX passed before it (label
+ * index, value, whether it had to wait, how long ago), to see which label
+ * orders a copy after the producer (an SPU job) that fills its source. */
+static u32 s_xs_off, s_xs_val, s_xs_waited;
+static unsigned long long s_xs_ms;
+static void gcm_xfer_sync_log(u32 src_loc, u32 src_off, u32 dst_loc, u32 dst_off, u32 w, u32 h,
+                              u32 in_pitch)
+{
+    static int left = -1;
+    if (left < 0) { const char* e = getenv("GCM_XFER_SYNC_LOG"); left = e ? atoi(e) : 0; }
+    if (left <= 0) return;
+    left--;
+    extern unsigned long long ps3_ms_now(void);
+    const unsigned long long now = ps3_ms_now();
+    const u32 li = (s_xs_off >> 4) & 0xFFu;
+    fprintf(stderr, "[xfer-sync] %llu ms: %u:0x%08X -> %u:0x%08X %ux%u; last acquire label 0x%02X == 0x%08X (%s, %llu ms ago; now 0x%08X)\n",
+            now, src_loc, src_off, dst_loc, dst_off, w, h, li, s_xs_val,
+            s_xs_waited ? "waited" : "ready", s_xs_ms ? now - s_xs_ms : 0ull,
+            vm_read32(GCM_LABEL_GUEST_BASE + (s_xs_off & 0xFFFFu)));
+    /* A copy out of main memory whose source has a mostly-zero 128-row band:
+     * count the band's zero words again a little later, to tell a producer
+     * that is still writing (the counts fall) from one that never writes. */
+    if (src_loc == RSX_LOCATION_MAIN && in_pitch && h >= 512u && w >= 256u) {
+        const u32 ea = gcm_io2ea(src_off);
+        if (!ea) return;
+        /* LittleBigPlanet 2's one-frame black bars: in rows 384..511, either
+         * x = 128k+70..117 (vertical strips) or rows 454..503 (one stripe)
+         * all zero while the rest of the band is not. Count each region's
+         * zero words now and a little later. */
+        static const unsigned delays_us[] = { 0, 1000, 4000, 15000, 80000 };
+        u32 zin[5], zout[5], nin = 0, nout = 0, rows_mode = 0;
+        for (u32 k = 0; k < 5; k++) {
+            if (k && delays_us[k]) {
+#ifdef _WIN32
+                Sleep((delays_us[k] + 999u) / 1000u);
+#else
+                usleep(delays_us[k]);
+#endif
+            }
+            u32 a = 0, b = 0, na = 0, nb = 0;
+            for (u32 y = 384; y < 512; y += 2)
+                for (u32 x = 0; x < w; x += 2) {
+                    const u32 xm = x & 127u, ym = y - 384u;
+                    const int in = rows_mode ? (ym >= 70u && ym < 120u) : (xm >= 70u && xm < 118u);
+                    const u32 z = vm_read32(ea + y * in_pitch + x * 4u) == 0u;
+                    if (in) { a += z; na++; } else { b += z; nb++; }
+                }
+            zin[k] = a; zout[k] = b; nin = na; nout = nb;
+            if (k == 0) {
+                const int cols = na && a * 10u >= na * 9u && b * 10u < nb * 3u;
+                if (!cols) {
+                    /* try the stripe form */
+                    rows_mode = 1; a = b = na = nb = 0;
+                    for (u32 y = 384; y < 512; y += 2)
+                        for (u32 x = 0; x < w; x += 2) {
+                            const u32 ym = y - 384u;
+                            const int in = ym >= 70u && ym < 120u;
+                            const u32 z = vm_read32(ea + y * in_pitch + x * 4u) == 0u;
+                            if (in) { a += z; na++; } else { b += z; nb++; }
+                        }
+                    if (!(na && a * 10u >= na * 9u && b * 10u < nb * 3u)) return;
+                    zin[0] = a; zout[0] = b; nin = na; nout = nb;
+                }
+            }
+        }
+        fprintf(stderr, "[xfer-sync]   BARS (%s) zero in/out of %u/%u:", rows_mode ? "stripe" : "strips", nin, nout);
+        for (u32 k = 0; k < 5; k++)
+            fprintf(stderr, " +%ums %u/%u", (delays_us[k] + 999u) / 1000u, zin[k], zout[k]);
+        fprintf(stderr, "\n");
+    }
+}
+
 static void nv3089_engine_read(u32 in_pitch, u32 out_w, u32 out_h)
 {
     if (!rsx_draw_engine_enabled() || !out_w || !out_h) return;
@@ -1291,6 +1448,9 @@ static void nv3089_engine_read(u32 in_pitch, u32 out_w, u32 out_h)
     const u32 sy1 = (u32)((nv3089_origin(v0) + (u64)(out_h - 1) * s_nv3089.dt_dy) >> 20);
     if (sx1 < sx0 || sy1 < sy0) return;
     const u32 loc = (s_nv3089.src_dma != 0xFEED0001u) ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+    gcm_xfer_sync_log(loc, s_nv3089.in_off + sy0 * in_pitch + sx0 * 4u,
+                      (s_gcm2d.dst_dma != 0xFEED0001u) ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN,
+                      s_gcm2d.dst_offset, out_w, out_h, in_pitch);
     rsx_draw_engine_guest_read(loc, s_nv3089.in_off + sy0 * in_pitch + sx0 * 4u, in_pitch,
                                sx1 - sx0 + 1u, sy1 - sy0 + 1u);
 }
@@ -2818,9 +2978,30 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         } else if (!s_lsem[li].t0) s_lsem[li].t0 = nw;
                         gcm_sema_stats_tick(nw);
                     }
+                    const int xs_was_waiting = (m == 0x68u && s_acq_t0 && s_acq_off == s_sema_offset && s_acq_val == v);
                     if (m == 0x68u && s_acq_t0 && s_acq_off == s_sema_offset &&
                         s_acq_val == v && vm_read32(la) == v)
                         s_acq_t0 = 0;                /* satisfied: the bounded wait ends */
+                    /* GCM_ACQ_LOG=<after s>: every satisfied NV406E acquire and every
+                     * release, in FIFO order, on the ps3_ms_now clock ([acq]/[rel]),
+                     * to line the RSX's waits up with [lpoll]/[wwatch]/[xfer-sync]. */
+                    { static int al = -1; static unsigned long long al_t;
+                      extern unsigned long long ps3_ms_now(void);
+                      if (al < 0) { const char* e = getenv("GCM_ACQ_LOG"); al = e ? 1 : 0;
+                                    al_t = ps3_ms_now() + (e ? (unsigned long long)(atof(e) * 1000.0) : 0ull); }
+                      if (al && (m == 0x68u || m == 0x6Cu)) {
+                          const unsigned long long nw = ps3_ms_now();
+                          if (nw >= al_t && (m == 0x6Cu || vm_read32(la) == v))
+                              fprintf(stderr, "[%s] %llu ms label 0x%02X 0x%08X%s get 0x%08X\n",
+                                      m == 0x68u ? "acq" : "rel", nw, (s_sema_offset >> 4) & 0xFFu, v,
+                                      m == 0x68u ? (xs_was_waiting ? " (waited)" : " (ready)") : "",
+                                      s_fifo_getoff);
+                      } }
+                    if (m == 0x68u && vm_read32(la) == v) {
+                        extern unsigned long long ps3_ms_now(void);
+                        s_xs_waited = xs_was_waiting ? 1u : 0u;
+                        s_xs_off = s_sema_offset; s_xs_val = v; s_xs_ms = ps3_ms_now();
+                    }
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) {
                         /* The RSX has fetched past a RELEASE before its
@@ -4770,9 +4951,12 @@ void cellGcmSetUserCommand(u32 cmd)
 /* Called when a FIFO consumer retires a user-interrupt method. Publishing
  * the cause and pending marker is atomic; guest code runs later in the pump.
  * Like the driver cause register, multiple pending commands coalesce. */
+static int gcm_ucmd_log_on(void);
 void cellGcmQueueUserCommand(u32 cmd)
 {
     GCM_USER_STORE(cmd);
+    if (gcm_ucmd_log_on()) { extern unsigned long long ps3_ms_now(void);
+        fprintf(stderr, "[ucmd] %llu ms retire 0x%08X get 0x%08X\n", ps3_ms_now(), cmd, s_fifo_getoff); }
     if (gcm_user_queue_on()) {
         AcquireSRWLockExclusive(&s_uq_lock);
         if (s_uq_tail - s_uq_head >= GCM_UQ_N) {   /* full: drop the oldest, say so */

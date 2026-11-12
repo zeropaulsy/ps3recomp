@@ -65,6 +65,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ---------------------------------------------------------------------------
  * Run-time loaded entry points (Vulkan 1.0 core only)
@@ -2005,6 +2006,42 @@ static void vk_present_window(void)
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
 }
 
+/* PS3RECOMP_VK_SEQ_DIR=<existing dir>: also write every present (not every
+ * nth) as a half-size PPM named pNNNNNN_tSSSS.SS.ppm, starting once the run
+ * is PS3RECOMP_VK_SEQ_AFTER seconds old and stopping after
+ * PS3RECOMP_VK_SEQ_MAX files (default 2000). For catching one-frame glitches
+ * the every-nth dump misses; half size keeps a long window to ~0.7 MB a frame. */
+static void vk_dump_seq(const unsigned char* rgba)
+{
+    static int on = -1; static const char* dir; static double after, t0;
+    static unsigned maxn = 2000, n;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const double now = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+    if (on < 0) {
+        dir = getenv("PS3RECOMP_VK_SEQ_DIR"); on = (dir && *dir) ? 1 : 0;
+        const char* e = getenv("PS3RECOMP_VK_SEQ_AFTER"); after = e ? atof(e) : 0.0;
+        e = getenv("PS3RECOMP_VK_SEQ_MAX"); if (e && atoi(e) > 0) maxn = (unsigned)atoi(e);
+        t0 = now;
+        if (on) VK_LOG("sequence dump: t0 = CLOCK_MONOTONIC %.3f\n", t0);
+    }
+    if (!on || n >= maxn || now - t0 < after) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/p%06u_t%07.2f.ppm", dir, s_vk.presented, now - t0);
+    FILE* f = fopen(path, "wb");
+    if (!f) { VK_LOG("cannot open %s for the sequence dump\n", path); on = 0; return; }
+    const u32 w = s_vk.width / 2, h = s_vk.height / 2;
+    fprintf(f, "P6\n%u %u\n255\n", w, h);
+    unsigned char* row = (unsigned char*)malloc((size_t)w * 3);
+    for (u32 y = 0; y < h && row; y++) {
+        const unsigned char* src = rgba + (size_t)(y * 2) * s_vk.width * 4;
+        for (u32 x = 0; x < w; x++) memcpy(row + x * 3, src + (size_t)x * 8, 3);
+        fwrite(row, 1, (size_t)w * 3, f);
+    }
+    free(row);
+    fclose(f);
+    n++;
+}
+
 static void vk_dump_ppm(const unsigned char* rgba)
 {
     FILE* f = fopen(s_vk.dump_path, "wb");
@@ -2075,6 +2112,7 @@ static void vk_present_complete_locked(void)
           }
       } }
     if (s_vk.dump_path && (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
+    vk_dump_seq(px);
     vk_present_window();
 }
 
