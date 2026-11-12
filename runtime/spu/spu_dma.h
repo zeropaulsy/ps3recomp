@@ -170,6 +170,113 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    /* SPU_WRITE_WATCH=<ea>[,<ea>...] (hex, up to 8): log every PUT-class
+     * transfer or SDCRZ whose destination covers one of those guest
+     * addresses -- time (ps3_ms_now, the clock GCM_XFER_SYNC_LOG prints),
+     * SPU, image, pc, command, tag, range and the 32-bit word that lands on
+     * the watched address. SPU_WRITE_WATCH_AFTER=<s> starts it late. Shows
+     * who writes a shared buffer or a GCM label, and in what order. */
+    { static int s_ww = -1; static uint32_t s_wa[8]; static int s_wn; static unsigned long long s_wt;
+      extern unsigned long long ps3_ms_now(void);
+      if (s_ww < 0) {
+          const char* e = getenv("SPU_WRITE_WATCH"); s_ww = 0;
+          while (e && *e && s_wn < 8) { char* d; s_wa[s_wn++] = (uint32_t)strtoul(e, &d, 16);
+                                        e = (*d == ',') ? d + 1 : NULL; }
+          if (s_wn) { s_ww = 1; const char* a = getenv("SPU_WRITE_WATCH_AFTER");
+                      s_wt = ps3_ms_now() + (a ? (unsigned long long)(atof(a) * 1000.0) : 0ull); }
+      }
+      const uint32_t c16 = cmd & 0xFFFFu;
+      if (s_ww && (mfc_is_put(c16) || c16 == MFC_SDCRZ_CMD)) {
+          for (int i = 0; i < s_wn; i++) {
+              const uint32_t w = s_wa[i];
+              if ((uint32_t)ea > w || (uint32_t)ea + size <= w) continue;
+              const unsigned long long now = ps3_ms_now();
+              if (now < s_wt) break;
+              uint32_t val = 0;
+              if (c16 != MFC_SDCRZ_CMD) {
+                  const uint8_t* q = &spu->ls[(lsa + (w - (uint32_t)ea)) & SPU_LS_MASK];
+                  val = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+              }
+              fprintf(stderr, "[wwatch] %llu ms 0x%08X <- wid %u img %d ovl %d ctx %p pc 0x%05X cmd 0x%X tag %u ea 0x%08X size %u val 0x%08X\n",
+                      now, w, spu->ls[0x1DF], spu->image_id, spu->resident_ovl, (void*)spu,
+                      (uint32_t)spu->pc & SPU_LS_MASK, c16,
+                      spu->mfc_tag & 31u, (uint32_t)ea, size, val);
+          }
+      } }
+    /* SPU_OVL_IO_LOG=<ovl>[,<ovl>...] (decimal overlay image ids, up to 8):
+     * every DMA (GET or PUT class, list elements included) issued by a context
+     * whose resident job overlay is one of those, from SPU_WRITE_WATCH_AFTER:
+     * time, workload id (LS 0x1DC), spuNum, ctx, pc (>= 0x4000 is job code,
+     * below is the policy module), command, LSA, EA, size, first word. */
+    { static int s_oi = -1; static int s_ov[8]; static int s_on; static unsigned long long s_ot;
+      extern unsigned long long ps3_ms_now(void);
+      if (s_oi < 0) {
+          const char* e = getenv("SPU_OVL_IO_LOG"); s_oi = 0;
+          while (e && *e && s_on < 8) { char* d; s_ov[s_on++] = (int)strtol(e, &d, 10);
+                                        e = (*d == ',') ? d + 1 : NULL; }
+          if (s_on) { s_oi = 1; const char* a = getenv("SPU_WRITE_WATCH_AFTER");
+                      s_ot = ps3_ms_now() + (a ? (unsigned long long)(atof(a) * 1000.0) : 0ull); }
+      }
+      if (s_oi) {
+          int hit = 0;
+          for (int i = 0; i < s_on; i++) if (spu->resident_ovl == s_ov[i]) hit = 1;
+          const uint32_t c16 = cmd & 0xFFFFu;
+          if (hit && (mfc_is_put(c16) || mfc_is_get(c16) || c16 == MFC_SDCRZ_CMD)) {
+              const unsigned long long now = ps3_ms_now();
+              if (now >= s_ot) {
+                  const uint8_t* q = mfc_is_get(c16) ? vm_base + (uint32_t)ea : &spu->ls[lsa & SPU_LS_MASK];
+                  const uint32_t w0 = (c16 == MFC_SDCRZ_CMD) ? 0u :
+                      ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+                  fprintf(stderr, "[ovl-io] %llu ms wid %u spuNum %u ovl %d ctx %p pc 0x%05X %s cmd 0x%X lsa 0x%05X ea 0x%08X size %u w0 0x%08X\n",
+                          now, spu->ls[0x1DF], spu->ls[0x1CB], spu->resident_ovl, (void*)spu,
+                          (uint32_t)spu->pc & SPU_LS_MASK, mfc_is_get(c16) ? "GET" : "PUT", c16,
+                          lsa & SPU_LS_MASK, (uint32_t)ea, size, w0);
+              }
+          }
+      } }
+    /* WWS_BARRIER_LOG=<pm image>: the Wws_Job PM's general-barrier check
+     * (GetJobFromJobList: a 16-byte GET to LS 0x14E0 of the dependency named
+     * by the barrier header, r62; it passes when the halfword there is 0). */
+    { static int s_bl = -2;
+      if (s_bl == -2) { const char* e = getenv("WWS_BARRIER_LOG"); s_bl = e ? atoi(e) : -1; }
+      if (s_bl >= 0 && spu->image_id == s_bl && lsa == 0x14E0 && size == 16 && mfc_is_get(cmd & 0xFFFFu)) {
+          extern unsigned long long ps3_ms_now(void);
+          const uint32_t dep = spu->gpr[62]._u32[0];
+          const uint8_t* q = vm_base + dep;
+          fprintf(stderr, "[wws-dep] %llu ms barrier check wid %u spuNum %u ctx %p dep 0x%08X counter %u (rc %u) -> %s\n",
+                  ps3_ms_now(), spu->ls[0x1DF], spu->ls[0x1CB], (void*)spu, dep, ((uint32_t)q[0] << 8) | q[1], q[2],
+                  (q[0] | q[1]) ? "BLOCKED" : "pass");
+      } }
+    /* SPU_GET_WATCH=<lo>-<hi> (hex EAs): log GET-class transfers that read
+     * from [lo,hi) once SPU_WRITE_WATCH_AFTER has passed: time, SPU, image,
+     * pc, range and the first word read. A run of identical reads (same pc,
+     * EA and value: a poll loop) prints once, then once more with its count
+     * when it changes. Shows what label or flag a job waits on. */
+    { static int s_gw = -1; static uint32_t s_glo, s_ghi; static unsigned long long s_gt;
+      static uint32_t l_pc, l_ea, l_val; static int l_img; static unsigned long l_rep;
+      extern unsigned long long ps3_ms_now(void);
+      if (s_gw < 0) {
+          const char* e = getenv("SPU_GET_WATCH"); s_gw = 0;
+          if (e) { char* d; s_glo = (uint32_t)strtoul(e, &d, 16);
+                   if (*d == '-') { s_ghi = (uint32_t)strtoul(d + 1, 0, 16); s_gw = s_ghi > s_glo; } }
+          const char* a = getenv("SPU_WRITE_WATCH_AFTER");
+          s_gt = ps3_ms_now() + (a ? (unsigned long long)(atof(a) * 1000.0) : 0ull);
+      }
+      if (s_gw && mfc_is_get(cmd & 0xFFFFu) && (uint32_t)ea < s_ghi && (uint32_t)ea + size > s_glo) {
+          const unsigned long long now = ps3_ms_now();
+          if (now >= s_gt) {
+              const uint8_t* q = vm_base + (uint32_t)ea;
+              const uint32_t val = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+              const uint32_t pc = (uint32_t)spu->pc & SPU_LS_MASK;
+              if (pc == l_pc && (uint32_t)ea == l_ea && val == l_val && spu->image_id == l_img) l_rep++;
+              else {
+                  if (l_rep) fprintf(stderr, "[gwatch]   (previous read repeated %lu times)\n", l_rep);
+                  fprintf(stderr, "[gwatch] %llu ms spu %u img %d pc 0x%05X cmd 0x%X ea 0x%08X size %u word 0x%08X\n",
+                          now, spu->spu_id & 7u, spu->image_id, pc, cmd & 0xFFFFu, (uint32_t)ea, size, val);
+                  l_pc = pc; l_ea = (uint32_t)ea; l_val = val; l_img = spu->image_id; l_rep = 0;
+              }
+          }
+      } }
     /* Upper16 command-channel bits carry replacement/transfer class IDs. */
     if ((cmd & 0xFFFFu) == MFC_SDCRZ_CMD) {
         /* CBEA 1.02 section 7.7.3: SDCRZ writes zeros in EA space, without an

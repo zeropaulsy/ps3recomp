@@ -586,6 +586,7 @@ static void spurs_api_unlock(struct SpursInst* si)
 }
 
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
+static u32 spurs_dispatch_mask(void);
 static int spurs_guest_range_valid(u32 ea, u32 bytes);
 
 static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix,
@@ -1998,10 +1999,16 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
             SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
         if (si->stopping && !slot->busy) break;
         ReleaseSRWLockExclusive(&si->lock);
+        extern unsigned long long ps3_ms_now(void);
+        const unsigned long long run_t0 = ps3_ms_now();
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
                               slot->data, slot->wid, slot->ea, slot->spu_num);
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
+        if (spurs_dispatch_mask() & (1u << (slot->wid & 31)))
+            fprintf(stderr, "[spurs-end] %llu ms wid %u lane %u polls %u ran %llu ms ready now %u\n",
+                    ps3_ms_now(), slot->wid, slot->spu_num, polls, ps3_ms_now() - run_t0,
+                    vm_read8(slot->ea + wkl_ready_off(slot->wid)));
         AcquireSRWLockExclusive(&si->lock);
         u32 wid = slot->wid;
         if (si->active[wid]) si->active[wid]--;
@@ -2016,6 +2023,23 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     ReleaseSRWLockExclusive(&si->lock);
     ps3_tprof_thread_exit();
     return 0;
+}
+
+/* SPURS_DISPATCH_LOG=<wid mask hex>: each dispatch of those workloads (time,
+ * lane, readyCount and signal as found, kicked or idle probe) and each run end
+ * (polls, run length), on the ps3_ms_now clock. */
+static u32 spurs_dispatch_mask(void)
+{
+    static int s_i = 0; static u32 s_m;
+    if (!s_i) { const char* e = getenv("SPURS_DISPATCH_LOG"); s_m = e ? (u32)strtoul(e, 0, 16) : 0; s_i = 1; }
+    return s_m;
+}
+static void spurs_dispatch_log(u32 wid, u32 sn, u32 ready, u32 signal, int kicked, int kick_pass)
+{
+    if (!(spurs_dispatch_mask() & (1u << (wid & 31)))) return;
+    extern unsigned long long ps3_ms_now(void);
+    fprintf(stderr, "[spurs-disp] %llu ms wid %u lane %u ready %u signal 0x%04X %s%s\n",
+            ps3_ms_now(), wid, sn, ready, signal, kicked ? "kicked" : "probe", kick_pass ? " (kick pass)" : "");
 }
 
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
@@ -2077,6 +2101,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 spu_lockline_lock();
                 ready = vm_read8(ea + wkl_ready_off(wid));
                 signal = vm_read16(ea + wkl_signal_off(wid));
+                spurs_dispatch_log(wid, sn, ready, signal, kicked, kick_pass);
                 if (ready) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
                 if (signal & wkl_signal_bit(wid))
                     ef_w16(ea + wkl_signal_off(wid), (u16)(signal & ~wkl_signal_bit(wid)));

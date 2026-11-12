@@ -891,6 +891,31 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                                         " line=%08X %08X %08X %08X %08X %08X %08X %08X\n",
                                 n, ctx->image_id, (void*)ctx, ea,
                                 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]); } } }
+            /* WWS_BARRIER_LOG=<pm image>: the Wws_Job PM's dependency-counter
+             * decrement (DependencyDecrement, PUTLLC at LS 0x2598..0x25FF; r0 =
+             * the counter's offset in the line): time, lane, the job overlay
+             * last resident on this lane, counter EA and its new value. */
+            { static int s_bl = -2;
+              if (s_bl == -2) { const char* e = getenv("WWS_BARRIER_LOG"); s_bl = e ? atoi(e) : -1; }
+              const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+              /* ...and the PM's readyCount store (LS 0x3868: PUTLLC of the SPURS
+               * instance's first line; r6 = (wid & 15) - 3, r8 = new value, r3 =
+               * the old value; base 0x110 means wid >= 16). */
+              if (s_bl >= 0 && ctx->image_id == s_bl && pc >= 0x38A4 && pc < 0x3900) {
+                  extern unsigned long long ps3_ms_now(void);
+                  const uint32_t w = ((ctx->gpr[6]._u32[0] + 3u) & 15u) + (ctx->gpr[4]._u32[0] == 272u ? 16u : 0u);
+                  fprintf(stderr, "[wws-rc] %llu ms wid %u spuNum %u sets readyCount of wid %u: %u -> %u\n",
+                          ps3_ms_now(), ctx->ls[0x1DF], ctx->ls[0x1CB], w,
+                          ctx->gpr[3]._u32[0] & 255u, ctx->gpr[8]._u32[0] & 255u);
+              }
+              if (s_bl >= 0 && ctx->image_id == s_bl && pc >= 0x2598 && pc < 0x2600) {
+                  extern unsigned long long ps3_ms_now(void);
+                  const uint32_t off = ctx->gpr[0]._u32[0] & 127u;
+                  const uint8_t* q = ls + off;
+                  fprintf(stderr, "[wws-dep] %llu ms dec wid %u spuNum %u ctx %p ovl %d dep 0x%08X -> %u (wake wid %u ready %u)\n",
+                          ps3_ms_now(), ctx->ls[0x1DF], ctx->ls[0x1CB], (void*)ctx, ctx->resident_ovl,
+                          (ea & ~127u) + off, ((uint32_t)q[0] << 8) | q[1], q[2], q[3]);
+              } }
             spu_coh_notify_write(ea);
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
         } else {
