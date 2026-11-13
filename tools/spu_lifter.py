@@ -338,6 +338,84 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
     return jumps
 
 
+# Local-store addresses spu_indirect_branch treats specially (SPURS kernel
+# services, the taskset syscall, the policy entry, the planted job return) or
+# where its taskset bookkeeping changes sides (SPU_TASKSET_TASK_LO). A constant
+# branch to one of these keeps the full dispatch.
+_CONST_BI_SPECIAL = {0x0, 0x9C0, 0x9D0, 0xA00, 0xA70, 0x3FF00}
+_CONST_BI_TASK_LO = 0x3000
+
+
+def _imm_int(token: str):
+    t = token.strip()
+    try:
+        return int(t, 0)
+    except ValueError:
+        return None
+
+
+def compute_const_bi_targets(insns, bounds, func_starts, exclude=()) -> dict:
+    """`bi $rN` whose target is a constant the same block just loaded:
+
+        ila $r2, 0x4A70
+        bid $r2                 ; 0x4A70 is the next instruction
+
+    Sony's SPU code opens and closes interrupt windows this way (WWS job
+    modules bracket every job-manager call with `bid`/`bie`), and the plain
+    indirect-branch lifting turns each one into a return to the drain loop and a
+    spu_indirect_branch lookup of a target that is known here. Returns
+    {bi addr: target} for the sites whose nearest preceding write to rN in the
+    same block is `il`/`ila rN, K` (identity moves looked through), with no
+    branch target or entry between that write and the bi, K the start of a
+    lifted function of this image, and K not one of _CONST_BI_SPECIAL nor on the
+    other side of _CONST_BI_TASK_LO. Those are emitted as SPU_DIRECT (which
+    still returns to the drain when an interrupt is pending)."""
+    out = {}
+    ordered = sorted(insns, key=lambda x: x.addr)
+    entered = set(func_starts)
+    for ins in ordered:
+        t = SPULifter._branch_target(ins)
+        if t is not None:
+            entered.add(t)
+    for (s, e) in bounds:
+        fn = [i for i in ordered if s <= i.addr < e]
+        for idx, insn in enumerate(fn):
+            if insn.mnemonic != "bi" or insn.addr in exclude:
+                continue
+            reg = _bi_target_reg(insn)
+            if reg is None or not reg.isdigit():
+                continue
+            n = int(reg)
+            if insn.addr in entered:
+                continue                   # reachable with any rN
+            k = None
+            for j in range(idx - 1, -1, -1):
+                w = fn[j]
+                if w.mnemonic in ("bi", "br", "bra", "iret", "stop", "stopd",
+                                  "brsl", "brasl", "bisl", "bisled"):
+                    break                  # block or call boundary
+                writes = w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == n
+                if writes and _is_identity_move(w):
+                    if w.addr in entered:
+                        break
+                    continue
+                if writes:
+                    if w.mnemonic in ("il", "ila"):
+                        ops = _ops(w.operands)
+                        v = _imm_int(ops[1]) if len(ops) >= 2 else None
+                        if v is not None and v >= 0:
+                            k = v & 0x3FFFC
+                    break
+                if w.addr in entered:
+                    break                  # a branch lands between write and bi
+            if k is None or k not in func_starts or k in _CONST_BI_SPECIAL:
+                continue
+            if (k < _CONST_BI_TASK_LO) != (insn.addr < _CONST_BI_TASK_LO):
+                continue
+            out[insn.addr] = k
+    return out
+
+
 def merge_chunk_groups(insns, bounds, max_insns, entry_points=()) -> dict:
     """Group contiguous chunks into function-sized runs for --merge-chunks.
 
@@ -535,6 +613,9 @@ class SPULifter:
         # compute_link_returns(). Emitted as `return;` so they compose with the
         # brsl->C-call nesting instead of branching to an unregistered PC.
         self.link_return: set = set()
+        # {addr: target} of `bi $rN` with a constant target loaded in-block
+        # (compute_const_bi_targets): emitted as a direct transfer.
+        self.const_bi: dict = {}
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -990,6 +1071,18 @@ class SPULifter:
                 if tgt_reg != "0":
                     return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
                 return f"{_ied}SPU_RET(ctx);"
+            # Constant target loaded in this block (compute_const_bi_targets):
+            # a direct transfer, which still hands back to the drain when an
+            # interrupt is pending. Unless the branch disables interrupts, an
+            # interrupt handler still in progress (irq_saved) takes the full
+            # dispatch: spu_indirect_branch's register restore may apply.
+            if addr in self.const_bi:
+                k = self.const_bi[addr]
+                guard = ("" if insn.raw & 0x80000 else
+                         f"if (ctx->irq_saved) {{ ctx->pc = {self._pc(k)}; "
+                         f"g_spu_trampoline_fn = spu_indirect_branch; return; }} ")
+                return (f"{_ied}{guard}{{ SPU_DIRECT(ctx, {self._pc(k)}, "
+                        f"{self.prefix}spu_func_{k:08X}); }}")
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
             return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
@@ -1180,6 +1273,9 @@ def main() -> None:
                         "0x10F8,0x808) to add as boundaries -- for indirect-branch "
                         "targets that --auto-functions can't detect statically. "
                         "Splits the containing auto-detected function at each addr.")
+    p.add_argument("--no-const-bi", action="store_true",
+                   help="lift every `bi $rN` through spu_indirect_branch, also when "
+                        "rN holds a constant loaded in the same block")
     p.add_argument("--return-entries", action="store_true",
                    help="Also make the return address of every call (brsl, "
                         "brasl, bisl, bisled) an entry point. Code that is "
@@ -1359,6 +1455,14 @@ def main() -> None:
               f"(`bi $rN` where rN is a brsl/bisl link reg): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
+    if not args.no_const_bi and not args.reloc:
+        forced = ({int(x, 0) for x in args.force_indirect.split(",") if x.strip()}
+                  if args.force_indirect else set())
+        lifter.const_bi = compute_const_bi_targets(
+            insns, bounds, lifter.func_starts,
+            exclude=forced | lifter.link_return)
+        if lifter.const_bi:
+            print(f"  {len(lifter.const_bi)} constant-target `bi` site(s) lifted as direct transfers")
     groups = {}
     if args.merge_chunks:
         seeds = {base}

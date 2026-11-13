@@ -1039,15 +1039,15 @@ static inline void spu_pchist_tick(const spu_context* ctx)
  * not the run's first transfer (the LS 0 check counts steps from there), the
  * target is not in the stack-reset hint table, and no interrupt is pending
  * with interrupts enabled. Anything else takes the trampoline as before. Tail calls need
- * clang's musttail; other compilers always take the trampoline.
+ * musttail (clang, or GCC 15 and later); other compilers always take the trampoline.
  * PS3_SPU_DIRECT=0 = always the trampoline; the diagnostics that watch each
  * drain step (SPU_LOCKSTEP, SPU_STEPTRACE, SPURS_PM_FLOW, ...) turn it off
  * too (spu_drain.c). */
 extern volatile int g_spu_direct;                /* spu_drain.c: -1 unread, 0 off, 1 on */
 extern uint8_t g_spu_stack_reset_hint[1024];     /* spu_channels.c, by (entry >> 2) & 1023 */
 void spu_direct_init(void);
-#if defined(__clang__) && defined(__has_attribute)
-#  if __has_attribute(musttail)
+#if (defined(__clang__) || defined(__GNUC__)) && defined(__has_attribute)
+#  if __has_attribute(musttail)          /* clang; GCC from 15 */
 #    define SPU_DIRECT_TAILCALLS 1
 #  endif
 #endif

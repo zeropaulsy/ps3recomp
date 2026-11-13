@@ -2565,9 +2565,11 @@ static int spu_smc_microstep(spu_context* ctx)
      * Ascension's serial EDGE chain, ~7% of its time at ~25 ns an instruction
      * the generic way. Only while every LS diagnostic is off (they read 0 once
      * the first access has read their switches); otherwise the generic path
-     * below runs them. */
+     * below runs them. The WWS policy module's own image used to be excluded
+     * too, but all that differs there is the SPU_WWS_PROBE diagnostic, and
+     * that is where the job manager's stubs run (LittleBigPlanet 2: image 1). */
     const int ldst_fast = g_spu_ls_watch_n == 0 && g_spu_ls_probe == 0 &&
-                          g_spu_smc_watch == 0 && ctx->image_id != spu_wws_pm_image();
+                          g_spu_smc_watch == 0 && !spu_ls_wws_probe_on();
     for (int steps = 0; steps < 4096; steps++) {
         if (ldst_fast) {
             for (; steps < 4096; steps++, pc = (pc + 4) & SPU_LS_MASK) {
@@ -3246,7 +3248,7 @@ void spu_indirect_branch(spu_context* ctx)
          * stack -- a plain call here leaked a resolver+callee frame per
          * iteration and blew the thread stack ~4k iterations into the first
          * really-decoding movie frame (silent 0x80000001 death). */
-#if defined(__clang__)
+#if defined(SPU_DIRECT_TAILCALLS)   /* clang, GCC 15+ (spu_context.h) */
         __attribute__((musttail)) return fn(ctx);
 #else
         fn(ctx);
