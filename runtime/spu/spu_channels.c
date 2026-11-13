@@ -2565,9 +2565,15 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
                 return;
             }
             yz_lockstep_block_begin(ctx);
+            const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
             spu_taskset_parked_add(ts, tid, wobj);
             spu_taskset_wait_signal(ts, tid);
             spu_taskset_parked_del(ts, tid);
+            if (ft_t0) {   /* parked time; b = the taskset, not the LS pc (always the 0xA70 stub) */
+                const uint64_t ft_t1 = ps3_ft_now();
+                if (ft_t1 - ft_t0 >= ps3_ft_min_ns())
+                    ps3_ft_span(PS3_FT_SPU_WAIT, ctx->spu_id, 0x10000u | (tid & 0xFFFFu), ts, ft_t0, ft_t1);
+            }
             yz_lockstep_block_end(ctx);
             spu_ef_deliver_owed(ctx, wobj);
         }

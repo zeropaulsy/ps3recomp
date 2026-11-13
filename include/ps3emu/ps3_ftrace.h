@@ -58,6 +58,11 @@ enum ps3_ft_kind {
                               * complete; who = render passes, a = depth resolves | colour copies << 16,
                               * b = 1 present / 0 flush */
     PS3_FT_HLE         = 15, /* who = PPU tid, a = NID, b = guest lr: an HLE import call */
+    PS3_FT_TASK_WAKE   = 16, /* instant: a parked SPURS taskset task may wake. b = taskset EA;
+                              * a = 0x10000 | task id for a signal sent through
+                              * spu_taskset_signal_task (PPU side), 0x20000 for an SPU commit to
+                              * a parked taskset's signalled line. (A task's parked time is an
+                              * SPU_WAIT span with channel 0x10000 | task id.) */
 };
 
 /* selectany (a COMDAT "any": one definition kept, every object sees the same

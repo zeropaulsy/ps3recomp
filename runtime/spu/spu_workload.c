@@ -14,6 +14,7 @@
 #include <string.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
+#include "ps3emu/ps3_ftrace.h"     /* PS3_FTRACE: task wake instants */
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -1375,6 +1376,8 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
     /* Update before taking s_sig_lock: watched-line notifications run under
      * lock-line and take s_sig_lock, so lock-line must never nest inside it. */
     spu_signalled_update(taskset_ea, taskId, 1);
+    if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
+                       ps3_ft_span(PS3_FT_TASK_WAKE, 0, 0x10000u | taskId, taskset_ea, t, t); }
     spu_taskset_wake_written(NULL);
     { static int _n = 0; if (PS3_LOG_FIRST(_n, 24))
         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
@@ -1454,6 +1457,8 @@ void spu_taskset_line_committed(uint32_t line)
     for (int i = 0; i < n; i++) {
         const uint64_t k = s_parked[i];
         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
+        if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
+                           ps3_ft_span(PS3_FT_TASK_WAKE, 0, 0x20000u, (uint32_t)(k >> 32), t, t); }
 #ifdef _WIN32
         AcquireSRWLockExclusive(&s_sig_lock);
         WakeAllConditionVariable(&s_sig_cv);
