@@ -2027,6 +2027,39 @@ static int spu_ovl_ea_known(uint32_t ea)
     return 1;   /* full (cannot happen): never filter */
 }
 
+/* The same for content signatures: a GET of 512 bytes or more was compared
+ * with every signature entry (16-byte compare, ~100 WWS job modules), on
+ * every such GET -- ~9% of each LittleBigPlanet 2 MLAA task thread, which
+ * streams image rows in large pieces. This set holds the first 8 bytes of
+ * every signature, inserted before the count that publishes the entry, so a
+ * GET whose first 8 bytes are in no signature cannot match one. */
+#define SPU_OVL_SIG_SET 512u
+static uint64_t s_ovl_sig_set[SPU_OVL_SIG_SET];
+static uint8_t s_ovl_sig_used[SPU_OVL_SIG_SET];
+static unsigned spu_ovl_sig_slot(uint64_t k) { return (unsigned)((k * 0x9E3779B97F4A7C15ull) >> 55); }
+static void spu_ovl_sig_add(const uint8_t sig[16])
+{
+    uint64_t k; memcpy(&k, sig, 8);
+    for (unsigned i = spu_ovl_sig_slot(k), n = 0; n < SPU_OVL_SIG_SET; ++n, i = (i + 1) & (SPU_OVL_SIG_SET - 1)) {
+        if (__atomic_load_n(&s_ovl_sig_used[i], __ATOMIC_ACQUIRE)) {
+            if (s_ovl_sig_set[i] == k) return;
+            continue;
+        }
+        s_ovl_sig_set[i] = k;
+        __atomic_store_n(&s_ovl_sig_used[i], 1, __ATOMIC_RELEASE);
+        return;
+    }
+}
+static int spu_ovl_sig_known(const uint8_t* ls)
+{
+    uint64_t k; memcpy(&k, ls, 8);
+    for (unsigned i = spu_ovl_sig_slot(k), n = 0; n < SPU_OVL_SIG_SET; ++n, i = (i + 1) & (SPU_OVL_SIG_SET - 1)) {
+        if (!__atomic_load_n(&s_ovl_sig_used[i], __ATOMIC_ACQUIRE)) return 0;
+        if (s_ovl_sig_set[i] == k) return 1;
+    }
+    return 1;   /* full (cannot happen): never filter */
+}
+
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
 {
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
@@ -2228,6 +2261,7 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
         s_ovl_src[s_ovl_src_count].has_sig = 1;
+        spu_ovl_sig_add(sig);
         atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
@@ -2310,7 +2344,8 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
      * Acquire count before the signature flag: if this snapshot contains a
      * signature, its earlier flag publication is visible. A racing future
      * signature can only force an unnecessary scan of the older snapshot. */
-    if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)) &&
+    if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire) ||
+         !spu_ovl_sig_known(ls)) &&
         !spu_ovl_ea_known(ea)) return;
     for (int i = 0; i < nsrc; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
