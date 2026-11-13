@@ -237,16 +237,16 @@ void spu_stop(spu_context* ctx)
     if (s_halt) spu_halt(ctx);
 }
 
-/* SPU_FLOAT_RZ=1: SPU code runs with FPCR at round toward zero with flush-to-zero, so the
- * single-precision helpers take their native form (spu_helpers.h, spu__nv_rz). The mode is set
- * on entry to spu_run_with_halt and the caller's FPCR is put back on the way out: a run can
- * happen synchronously on a PPU thread (a workload dispatched from the PPU caller), whose
- * lifted floating point must keep round to nearest with denormals. Double precision restores
- * the default around itself inside a run. arm64 only; elsewhere the exact forms always run.
- * Returns the FPCR to restore, or ~0 when nothing was changed. */
-static uint64_t spu_float_mode_enter(void)
+/* SPU_FLOAT_RZ=1: SPU code runs with round toward zero and flush-to-zero, so the
+ * single-precision helpers take their native form (spu_helpers.h: spu__nv_rz on arm64, FPCR;
+ * spu__xr_on on x86, MXCSR with FZ and DAZ). The mode is set on entry to spu_run_with_halt and
+ * the caller's is put back on the way out: a run can happen synchronously on a PPU thread (a
+ * workload dispatched from the PPU caller), whose lifted floating point must keep round to
+ * nearest with denormals. Double precision restores the default around itself inside a run.
+ * Elsewhere the exact forms always run. Returns the mode to restore, or ~0 when nothing was
+ * changed. */
+static int spu_float_rz_wanted(void)
 {
-#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
     static int s_on = -1;
     int on = __atomic_load_n(&s_on, __ATOMIC_RELAXED);
     if (on < 0) {
@@ -254,11 +254,22 @@ static uint64_t spu_float_mode_enter(void)
         on = e && e[0] == '1' && !e[1];
         __atomic_store_n(&s_on, on, __ATOMIC_RELAXED);
     }
-    if (!on) return ~0ull;
+    return on;
+}
+static uint64_t spu_float_mode_enter(void)
+{
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+    if (!spu_float_rz_wanted()) return ~0ull;
     uint64_t v;
     __asm__ volatile("mrs %0, fpcr" : "=r"(v));
     if (v == SPU_FPCR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
     __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)SPU_FPCR_RZFZ));
+    return v;
+#elif (defined(__x86_64__) || defined(__i386__)) && defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS)
+    if (!spu_float_rz_wanted()) return ~0ull;
+    const unsigned v = _mm_getcsr();
+    if ((v & 0xFFC0u) == SPU_MXCSR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
+    _mm_setcsr(SPU_MXCSR_RZFZ | (v & 0x3Fu));            /* keep the sticky exception flags */
     return v;
 #else
     return ~0ull;
@@ -268,6 +279,8 @@ static void spu_float_mode_leave(uint64_t outer)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
     if (outer != ~0ull) __asm__ volatile("msr fpcr, %0" :: "r"(outer));
+#elif (defined(__x86_64__) || defined(__i386__)) && defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS)
+    if (outer != ~0ull) _mm_setcsr((unsigned)outer);
 #else
     (void)outer;
 #endif

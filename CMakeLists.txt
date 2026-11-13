@@ -458,6 +458,15 @@ if(PS3RECOMP_BUILD_TESTS)
         if(PS3RECOMP_HAS_MSSE41)
             target_compile_options(test_spu_float_exact PRIVATE -msse4.1 -ffp-contract=off)
             target_compile_options(test_spu_float_vector_scalar PRIVATE -msse4.1 -ffp-contract=off)
+            # SPU_FLOAT_RZ on x86: every float helper gives the same bits with MXCSR at round
+            # toward zero + FZ + DAZ as with the default MXCSR.
+            add_executable(test_spu_float_mode_x86
+                runtime/spu/tests/test_spu_float_mode_x86.c)
+            target_include_directories(test_spu_float_mode_x86 PRIVATE include runtime/spu)
+            target_compile_options(test_spu_float_mode_x86 PRIVATE -UNDEBUG -msse4.1 -ffp-contract=off)
+            target_link_libraries(test_spu_float_mode_x86 PRIVATE m)
+            add_test(NAME spu_float_mode_x86 COMMAND test_spu_float_mode_x86 4)
+            set_tests_properties(spu_float_mode_x86 PROPERTIES TIMEOUT 300)
         endif()
 
         # The interpreter's op/immediate decode at the opcode-width and
