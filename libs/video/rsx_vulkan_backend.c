@@ -2204,6 +2204,7 @@ typedef struct vk_eng_obj {
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
     u8       cube;                   /* TEXTURE: six layers, a CUBE view    */
     u8       snapshot;               /* COLOR: a feedback copy, never a target */
+    u8       dconv;                  /* COLOR snapshot made by depth_as_color   */
     u32      mips;                   /* TEXTURE: levels the image was created with */
 } vk_eng_obj;
 
@@ -2400,6 +2401,7 @@ static int vk_eng_init(void* user, u32 width, u32 height)
 }
 
 static void vk_eng_snapshot_recycle(vk_eng_obj* o);
+static void vk_dac_recycle(vk_eng_obj* o);
 
 static void vk_eng_release(void* user, u32 handle)
 {
@@ -2419,7 +2421,8 @@ static void vk_eng_release(void* user, u32 handle)
     if (s_eobj[handle].kind == VK_ENG_COLOR && s_eobj[handle].snapshot) {
         /* Never an attachment, so no framebuffer names it; the image goes
          * back to the pool for the next feedback draw. */
-        vk_eng_snapshot_recycle(&s_eobj[handle]);
+        if (s_eobj[handle].dconv) vk_dac_recycle(&s_eobj[handle]);
+        else vk_eng_snapshot_recycle(&s_eobj[handle]);
         memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
         return;
     }
@@ -2466,12 +2469,14 @@ static void vk_eng_depth_target_release(void* user, u32 handle)
 }
 
 static void vk_eng_snapshot_pool_drain(void);
+static void vk_dac_shutdown(void);
 
 static void vk_eng_shutdown(void* user)
 {
     vk_eng2_shutdown(user);
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
     vk_eng_snapshot_pool_drain();
+    vk_dac_shutdown();
     vk_eb_release();
     vk_destroy_buffer(&s_rb_stage);
     vk_destroy_buffer(&s_up_stage);
@@ -2924,6 +2929,274 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     }
     return rc ? 0 : snap;
 }
+
+/* ---- depth read as A8R8G8B8 (rsx_draw_backend.depth_as_color) ---------------
+ * A deferred renderer that rebuilds depth from the bytes reads its Z24S8 zeta
+ * as a linear A8R8G8B8 texture of the zeta's pitch. Without this hook the
+ * engine stores the depth into guest memory for each such read: a wait for
+ * the GPU, a conversion on the CPU and a decode and upload of the texture,
+ * several times a frame in LittleBigPlanet 2. Here the depth goes through the
+ * depth snapshot (an R32F copy, in command order and inside a draw batch) and
+ * one fullscreen pass that writes the texels the decode would give:
+ * R = depth bits 15..8, G = bits 7..0, B = 0 (the stencil byte), A = bits
+ * 23..16, with round(d * 0xFFFFFF) taken exactly as the engine's store takes
+ * it in double precision. d = m * 2^-s with a 24-bit m, so the value is
+ * (m * 2^24 - m + 2^(s-1)) >> s, done here in 32-bit halves (no Int64 needed).
+ * DEPTH16 and devices without a D32 depth format keep the store through guest
+ * memory (return 0). The result is a COLOR snapshot object, released through
+ * texture_release; its image and framebuffer go back to a small pool. */
+static int vk_eng_translate(const char* hlsl, int stage, VkShaderModule* out);
+
+static const char kVkDacVS[] =
+    "struct VOut { float4 pos : SV_Position; };\n"
+    "VOut main(uint vid : SV_VertexID) {\n"
+    "    VOut o;\n"
+    "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+    "    o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "    return o;\n"
+    "}\n";
+static const char kVkDacPS[] =
+    "Texture2D<float> src : register(t0);\n"
+    "uint round24(float d) {\n"
+    "    if (d >= 1.0) return 0xFFFFFFu;\n"
+    "    if (!(d > 0.0)) return 0u;\n"
+    "    const uint b = asuint(d);\n"
+    "    const uint e = (b >> 23) & 0xFFu;\n"
+    "    const uint m = (b & 0x7FFFFFu) | (e != 0u ? 0x800000u : 0u);\n"
+    "    const uint s = 150u - max(e, 1u);\n"          /* >= 24: d < 1 */
+    "    if (s >= 49u) return 0u;\n"                   /* m * (2^24 - 1) < 2^48 */
+    "    uint lo = m << 24, hi = m >> 8;\n"
+    "    hi -= (lo < m) ? 1u : 0u; lo -= m;\n"
+    "    const uint h = s - 1u;\n"
+    "    if (h < 32u) { const uint n = lo + (1u << h); hi += (n < lo) ? 1u : 0u; lo = n; }\n"
+    "    else hi += 1u << (h - 32u);\n"
+    "    return s < 32u ? ((lo >> s) | (hi << (32u - s))) : (hi >> (s - 32u));\n"
+    "}\n"
+    "float4 main(float4 pos : SV_Position) : SV_Target0 {\n"
+    "    const uint v = round24(src.Load(int3(int2(pos.xy), 0)));\n"
+    "    return float4(float((v >> 8) & 0xFFu), float(v & 0xFFu), 0.0, float(v >> 16)) / 255.0;\n"
+    "}\n";
+
+#define VK_DAC_POOL 8
+#define VK_DAC_SETS 64
+static struct {
+    int                   failed, ready;
+    VkRenderPass          rp;
+    VkDescriptorSetLayout dsl;
+    VkPipelineLayout      pl;
+    VkShaderModule        vs, fs;
+    VkPipeline            pipe;
+    VkDescriptorPool      dpool;
+    u32                   sets;      /* allocated since the last reset */
+    struct { vk_image im; VkFramebuffer fb; u32 w, h; } pool[VK_DAC_POOL];
+    u32                   npool;
+} s_dac;
+
+static int vk_dac_init(void)
+{
+    if (s_dac.ready) return 0;
+    if (s_dac.failed) return -1;
+    s_dac.failed = 1;                                 /* until everything below exists */
+    VkAttachmentDescription a = {
+        .format = VK_FORMAT_R8G8B8A8_UNORM, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkAttachmentReference ar = { 0, VK_IMAGE_LAYOUT_GENERAL };
+    VkSubpassDescription sp = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                .colorAttachmentCount = 1, .pColorAttachments = &ar };
+    VkRenderPassCreateInfo rpi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+                                   .attachmentCount = 1, .pAttachments = &a,
+                                   .subpassCount = 1, .pSubpasses = &sp };
+    if (pvkCreateRenderPass(s_vk.device, &rpi, NULL, &s_dac.rp) != VK_SUCCESS) return -1;
+    VkDescriptorSetLayoutBinding bd = { .binding = RSX_SPIRV_TEXTURE_BINDING,
+                                        .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT };
+    VkDescriptorSetLayoutCreateInfo dli = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                            .bindingCount = 1, .pBindings = &bd };
+    if (pvkCreateDescriptorSetLayout(s_vk.device, &dli, NULL, &s_dac.dsl) != VK_SUCCESS) return -1;
+    VkPipelineLayoutCreateInfo pli = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                       .setLayoutCount = 1, .pSetLayouts = &s_dac.dsl };
+    if (pvkCreatePipelineLayout(s_vk.device, &pli, NULL, &s_dac.pl) != VK_SUCCESS) return -1;
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DAC_SETS };
+    VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                       .maxSets = VK_DAC_SETS, .poolSizeCount = 1, .pPoolSizes = &ps };
+    if (pvkCreateDescriptorPool(s_vk.device, &dpi, NULL, &s_dac.dpool) != VK_SUCCESS) return -1;
+    if (vk_eng_translate(kVkDacVS, RSX_SHADER_STAGE_VERTEX, &s_dac.vs) ||
+        vk_eng_translate(kVkDacPS, RSX_SHADER_STAGE_FRAGMENT, &s_dac.fs)) {
+        VK_LOG("engine: depth-as-colour shaders failed; depth reads stay on the guest-memory path\n");
+        return -1;
+    }
+    VkPipelineShaderStageCreateInfo st[2] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = s_dac.vs, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = s_dac.fs, .pName = "main" } };
+    VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                  .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+    VkPipelineViewportStateCreateInfo vps = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                                              .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo ras = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
+    VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                                .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = 0xFu };
+    VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                               .attachmentCount = 1, .pAttachments = &cba };
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                            .dynamicStateCount = 2, .pDynamicStates = dyn };
+    VkGraphicsPipelineCreateInfo gpi = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = st,
+        .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vps,
+        .pRasterizationState = &ras, .pMultisampleState = &ms, .pColorBlendState = &cb,
+        .pDynamicState = &dy, .layout = s_dac.pl, .renderPass = s_dac.rp, .subpass = 0 };
+    if (pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gpi, NULL, &s_dac.pipe) != VK_SUCCESS)
+        return -1;
+    s_dac.failed = 0; s_dac.ready = 1;
+    VK_LOG("engine: depth read as A8R8G8B8 converted on the GPU\n");
+    return 0;
+}
+
+static void vk_dac_recycle(vk_eng_obj* o)
+{
+    /* The framebuffer stays with the image: find the pooled entry it came from. */
+    for (u32 i = 0; i < s_dac.npool; i++)
+        if (s_dac.pool[i].im.img == o->im.img && !s_dac.pool[i].w) {
+            s_dac.pool[i].w = o->w; s_dac.pool[i].h = o->h;   /* free again */
+            return;
+        }
+    vk_destroy_image(&o->im);                          /* not pooled (cannot happen) */
+}
+
+static void vk_dac_shutdown(void)
+{
+    for (u32 i = 0; i < s_dac.npool; i++) {
+        if (s_dac.pool[i].fb) pvkDestroyFramebuffer(s_vk.device, s_dac.pool[i].fb, NULL);
+        vk_destroy_image(&s_dac.pool[i].im);
+    }
+    s_dac.npool = 0;
+    if (s_dac.pipe) pvkDestroyPipeline(s_vk.device, s_dac.pipe, NULL);
+    if (s_dac.vs) pvkDestroyShaderModule(s_vk.device, s_dac.vs, NULL);
+    if (s_dac.fs) pvkDestroyShaderModule(s_vk.device, s_dac.fs, NULL);
+    if (s_dac.dpool) pvkDestroyDescriptorPool(s_vk.device, s_dac.dpool, NULL);
+    if (s_dac.pl) pvkDestroyPipelineLayout(s_vk.device, s_dac.pl, NULL);
+    if (s_dac.dsl) pvkDestroyDescriptorSetLayout(s_vk.device, s_dac.dsl, NULL);
+    if (s_dac.rp) pvkDestroyRenderPass(s_vk.device, s_dac.rp, NULL);
+    memset(&s_dac, 0, sizeof s_dac);
+}
+
+static u32 vk_eng_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
+{
+    if (rsx_fmt != RSX_TEX_FMT_A8R8G8B8 || !w || !h) return 0;
+    if (s_vk.depth_format != VK_FORMAT_D32_SFLOAT &&
+        s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) return 0;
+    { static int off = -1;
+      if (off < 0) { const char* e = getenv("VK_DEPTH_AS_COLOR"); off = e && *e == '0'; }
+      if (off) return 0; }
+    const vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
+    if (!z || w > z->w || h > z->h || vk_dac_init()) return 0;
+
+    /* A pooled target of this size, else a new one (a pool slot is "taken"
+     * while its w is 0). */
+    int slot = -1;
+    for (u32 i = 0; i < s_dac.npool; i++)
+        if (s_dac.pool[i].w == w && s_dac.pool[i].h == h) { slot = (int)i; break; }
+    int fresh = 0;
+    if (slot < 0) {
+        if (s_dac.npool < VK_DAC_POOL) slot = (int)s_dac.npool++;
+        else {                                         /* evict a free one of another size */
+            for (u32 i = 0; i < s_dac.npool; i++) if (s_dac.pool[i].w) { slot = (int)i; break; }
+            if (slot < 0) return 0;
+            if (s_dac.pool[slot].fb) pvkDestroyFramebuffer(s_vk.device, s_dac.pool[slot].fb, NULL);
+            vk_destroy_image(&s_dac.pool[slot].im);
+        }
+        memset(&s_dac.pool[slot], 0, sizeof s_dac.pool[slot]);
+        if (vk_create_image(&s_dac.pool[slot].im, VK_FORMAT_R8G8B8A8_UNORM, w, h,
+                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT)) {
+            vk_destroy_image(&s_dac.pool[slot].im); memset(&s_dac.pool[slot], 0, sizeof s_dac.pool[slot]);
+            return 0;
+        }
+        VkFramebufferCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                                        .renderPass = s_dac.rp, .attachmentCount = 1,
+                                        .pAttachments = &s_dac.pool[slot].im.view,
+                                        .width = w, .height = h, .layers = 1 };
+        if (pvkCreateFramebuffer(s_vk.device, &fci, NULL, &s_dac.pool[slot].fb) != VK_SUCCESS) {
+            vk_destroy_image(&s_dac.pool[slot].im); memset(&s_dac.pool[slot], 0, sizeof s_dac.pool[slot]);
+            return 0;
+        }
+        fresh = 1;
+    }
+
+    /* The depth as R32F, in command order (batched when batching is on). */
+    const u32 snap = vk_eng_depth_snapshot(user, depth, w, h);
+    const vk_eng_obj* src = vk_eng_get(snap, VK_ENG_TEXTURE);
+    if (!src || src->w != w || src->h != h) {
+        if (fresh) s_dac.pool[slot].w = w, s_dac.pool[slot].h = h;   /* keep it, free */
+        return 0;
+    }
+
+    const u32 hd = vk_eng_alloc();
+    if (!hd) { if (fresh) s_dac.pool[slot].w = w, s_dac.pool[slot].h = h; return 0; }
+    vk_eng_obj* o = &s_eobj[hd];
+    o->im = s_dac.pool[slot].im;
+    o->im.view = s_dac.pool[slot].im.view;
+    o->kind = VK_ENG_COLOR; o->snapshot = 1; o->dconv = 1;
+    o->fmt = VK_FORMAT_R8G8B8A8_UNORM; o->bpp = 4; o->w = w; o->h = h;
+    s_dac.pool[slot].w = 0; s_dac.pool[slot].h = 0;  /* taken */
+    /* The pool keeps the image; the object must not free it on its own. */
+
+    if (s_dac.sets >= VK_DAC_SETS) {                   /* every set may be in the open batch */
+        if (s_eb_pending) vk_eng_flush();
+        pvkResetDescriptorPool(s_vk.device, s_dac.dpool, 0);
+        s_dac.sets = 0;
+    }
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                        .descriptorPool = s_dac.dpool, .descriptorSetCount = 1,
+                                        .pSetLayouts = &s_dac.dsl };
+    if (pvkAllocateDescriptorSets(s_vk.device, &dai, &set) != VK_SUCCESS) {
+        vk_eng_release(user, hd); return 0;
+    }
+    s_dac.sets++;
+    VkDescriptorImageInfo ii = { .imageView = src->im.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkWriteDescriptorSet wr = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+                                .dstBinding = RSX_SPIRV_TEXTURE_BINDING, .descriptorCount = 1,
+                                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = &ii };
+    pvkUpdateDescriptorSets(s_vk.device, 1, &wr, 0, NULL);
+
+    const int batch = vk_eb_active();
+    if (!(batch && s_eb_pending) && vk_begin()) { vk_eng_release(user, hd); return 0; }
+    vk_cmd_after_everything(s_vk.cmd);                 /* after the snapshot's copies */
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT,
+                     fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL);
+    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                  .renderPass = s_dac.rp, .framebuffer = s_dac.pool[slot].fb,
+                                  .renderArea = { { 0, 0 }, { w, h } } };
+    pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_dac.pipe);
+    VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+    VkRect2D sc = { { 0, 0 }, { w, h } };
+    pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
+    pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
+    pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_dac.pl, 0, 1, &set, 0, NULL);
+    pvkCmdDraw(s_vk.cmd, 3, 1, 0, 0);
+    pvkCmdEndRenderPass(s_vk.cmd);
+    /* The texels, made visible to whatever samples them next. */
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    if (batch) {
+        if (++s_eb_pending >= vk_eb_max()) vk_eng_flush();
+    } else if (vk_submit_and_wait()) {
+        vk_eng_release(user, hd); return 0;
+    }
+    return hd;
+}
+
 /* The depth aspect of a D32_SFLOAT target copies out as 32-bit floats, which
  * is what the engine asks for; other depth formats report failure. */
 static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
@@ -4056,6 +4329,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .depth_target_create  = vk_eng_depth_target_create,
     .depth_target_release = vk_eng_depth_target_release,
     .depth_snapshot       = vk_eng_depth_snapshot,
+    .depth_as_color       = vk_eng_depth_as_color,
     .color_snapshot       = vk_eng_color_snapshot,
     .pipeline_create      = vk_eng_pipeline_create,
     .pipeline_release     = vk_eng_pipeline_release,

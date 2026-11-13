@@ -1259,6 +1259,48 @@ static int s_depth_via_guest;
  * shadow map, takes the same way: without it every read of a freshly
  * rendered shadow map is a wait for the GPU plus a decode and an upload of
  * up to 2 MB. Returns the view, or 0 for the store through guest memory. */
+static void eng_depth_row_to_guest(u8* dst, const float* src, u32 w, u32 bpp);
+
+/* RSX_ENGINE_ZDEPTH_CHECK=<n>: for the first n conversions, read the
+ * backend's texels back and compare them with what the store through guest
+ * memory would give for the same depth (eng_depth_row_to_guest, decoded as
+ * the texture unit decodes it). A8R8G8B8 only: guest bytes A,R,G,B are the
+ * texel's A,R,G,B. Each check waits for the GPU: a test, not a mode. */
+static void eng_zdepth_conv_check(const eng_zdepth* z, u32 base_fmt)
+{
+    static int left = -1;
+    if (left < 0) { const char* e = getenv("RSX_ENGINE_ZDEPTH_CHECK"); left = e ? atoi(e) : 0; }
+    if (left <= 0 || base_fmt != RSX_TEX_FMT_A8R8G8B8 || !g.be->readback || !g.be->depth_readback)
+        return;
+    left--;
+    const u32 w = z->conv_w, h = z->conv_h;
+    float* d = (float*)malloc((size_t)w * h * sizeof(float));
+    u8* got = (u8*)malloc((size_t)w * h * 4u);
+    u8* want = (u8*)malloc((size_t)w * 4u);
+    if (!d || !got || !want) { free(d); free(got); free(want); return; }
+    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    g.be->readback(g.be->user, z->conv, 0, 0, w, h, got, w * 4u);
+    const int rc = g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, d, w * (u32)sizeof(float));
+    unsigned long bad = 0, first = ~0ul;
+    for (u32 y = 0; rc == 0 && y < h; y++) {
+        eng_depth_row_to_guest(want, d + (size_t)y * w, w, 4u);
+        for (u32 x = 0; x < w; x++) {
+            const u8* q = got + ((size_t)y * w + x) * 4u;    /* R, G, B, A */
+            const u8* p = want + (size_t)x * 4u;             /* A, R, G, B */
+            if (q[0] != p[1] || q[1] != p[2] || q[2] != p[3] || q[3] != p[0]) {
+                if (!bad++) first = (unsigned long)y * w + x;
+            }
+        }
+    }
+    if (bad)
+        fprintf(stderr, "[rsx engine] depth-as-colour check %ux%u: %lu of %lu texels differ (first at x %lu y %lu)\n",
+                w, h, bad, (unsigned long)w * h, first % w, first / w);
+    else
+        fprintf(stderr, "[rsx engine] depth-as-colour check %ux%u: %s\n", w, h,
+                rc ? "no depth readback" : "all texels match");
+    free(d); free(got); free(want);
+}
+
 static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
 {
     eng_zdepth* z = &g.zdepths[slot];
@@ -1284,6 +1326,7 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
         z->conv = tex;
         z->conv_w = t->width; z->conv_h = t->height; z->conv_fmt = base_fmt;
         z->conv_serial = z->depth_serial;
+        eng_zdepth_conv_check(z, base_fmt);
     }
     return g.be->surface_view(g.be->user, z->conv, t->remap & 0xFFFFu, t->format);
 }
@@ -2907,6 +2950,25 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             }
             const u32 conv = eng_zdepth_as_color((u32)zsrc, &t);
             if (conv) { textures[u] = conv; continue; }
+            /* RSX_ENGINE_ZDEPTH_WHY=1: each distinct depth read that falls to
+             * the store through guest memory, with what decides the GPU path. */
+            { static int on = -1; static u32 seen[64]; static u32 nseen;
+              if (on < 0) { const char* e = getenv("RSX_ENGINE_ZDEPTH_WHY"); on = e && *e == '1'; }
+              const eng_zdepth* z = &g.zdepths[zsrc];
+              const u32 key = (t.format & 0xFFu) | ((z->zfmt & 0xFu) << 8) | ((t.width & 0xFFFu) << 12) |
+                              ((u32)(t.pitch == z->pitch) << 24) | ((u32)(current_zslot == (u32)zsrc) << 25) |
+                              ((u32)(t.mipmaps > 1) << 26) | ((t.cubemap & 1u) << 27) |
+                              ((u32)(t.dimension == 3) << 28);
+              u32 k = 0;
+              while (on && k < nseen && seen[k] != key) k++;
+              if (on && k == nseen && nseen < 64) {
+                  seen[nseen++] = key;
+                  fprintf(stderr, "[rsx engine] depth via guest: tex fmt 0x%02X %ux%u pitch %u mips %u "
+                          "cube %u dim %u | zeta fmt %u %ux%u (used %ux%u) pitch %u bound %d\n",
+                          t.format & 0xFFu, t.width, t.height, t.pitch, t.mipmaps, t.cubemap,
+                          t.dimension, z->zfmt, z->w, z->h, z->used_w, z->used_h, z->pitch,
+                          current_zslot == (u32)zsrc);
+              } }
             if (eng_zdepth_to_guest((u32)zsrc)) {
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                t.width, t.height, t.mipmaps, t.pitch,
