@@ -50,6 +50,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "../../include/ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: GPU wait spans */
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
@@ -455,7 +456,30 @@ static void vk_present_wait_gpu(void);
  * results flushes them first, so everything else keeps the invariant that
  * all earlier work has completed. */
 static u32 s_eb_pending;
-static void vk_eng_flush(void);
+static void vk_eng_flush_impl(void);
+
+/* PS3_FTRACE: the source line of the outermost vk_eng_flush / vk_begin /
+ * vk_destroy_image / vk_destroy_buffer call that led to the submission in
+ * progress, recorded as b of its GPU wait span (0 = none of them). */
+static u32 s_vk_ft_why;
+#if defined(__GNUC__)
+#  define VK_FT_WHY(T, call) ({ const u32 ft_o_ = s_vk_ft_why; if (!ft_o_) s_vk_ft_why = __LINE__; \
+                                T ft_r_ = (call); s_vk_ft_why = ft_o_; ft_r_; })
+#  define VK_FT_WHY_V(call) do { const u32 ft_o_ = s_vk_ft_why; if (!ft_o_) s_vk_ft_why = __LINE__; \
+                                 call; s_vk_ft_why = ft_o_; } while (0)
+#else
+#  define VK_FT_WHY(T, call) (call)
+#  define VK_FT_WHY_V(call) call
+#endif
+static void vk_destroy_image_impl(vk_image* im);
+static void vk_destroy_buffer_impl(vk_buffer* b);
+static int vk_begin_impl(void);
+#define vk_eng_flush()        VK_FT_WHY_V(vk_eng_flush_impl())
+#define vk_destroy_image(im)  VK_FT_WHY_V(vk_destroy_image_impl(im))
+#define vk_destroy_buffer(b)  VK_FT_WHY_V(vk_destroy_buffer_impl(b))
+#define vk_begin()            VK_FT_WHY(int, vk_begin_impl())
+static int vk_submit_and_wait_impl(void);
+#define vk_submit_and_wait()  VK_FT_WHY(int, vk_submit_and_wait_impl())
 static int vk_eb_active(void);       /* batching decided on and on */
 static u32 vk_eb_max(void);
 static void vk_eb_recorded(void);   /* one more command in the open batch */
@@ -463,8 +487,33 @@ static void vk_eb_release(void);    /* engine shutdown: rings and pool */
 static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src, size_t tight,
                         u32 rows, u32 row_bytes);   /* -2: not batched, do it the old way */
 
-static void vk_destroy_image(vk_image* im)
+/* A view with no image of its own (a crossbar view of a colour target)
+ * destroyed while a batch is open: recorded draws may still sample it, so it
+ * waits here and goes after the next flush has completed, instead of forcing
+ * that flush now. LBP2 releases its depth-read conversions (and their views)
+ * mid-frame four times a frame. VK_DEFER_VIEW_DESTROY=0: flush as before. */
+#define VK_GRAVE_MAX 256u
+static VkImageView s_vk_grave[VK_GRAVE_MAX];
+static u32 s_vk_grave_n;
+static int vk_defer_views(void)
 {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("VK_DEFER_VIEW_DESTROY"); on = !(e && *e == '0'); }
+    return on;
+}
+static void vk_grave_empty(void)   /* every submission so far has completed */
+{
+    for (u32 i = 0; i < s_vk_grave_n; i++) pvkDestroyImageView(s_vk.device, s_vk_grave[i], NULL);
+    s_vk_grave_n = 0;
+}
+
+static void vk_destroy_image_impl(vk_image* im)
+{
+    if (s_eb_pending && !im->img && im->view && s_vk_grave_n < VK_GRAVE_MAX && vk_defer_views()) {
+        s_vk_grave[s_vk_grave_n++] = im->view;
+        memset(im, 0, sizeof *im);
+        return;
+    }
     if (s_eb_pending) vk_eng_flush();
     /* Never under a present's copy that may still read it. */
     if (im->img) vk_present_wait_gpu();
@@ -526,7 +575,7 @@ static int vk_create_device_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsag
     return 0;
 }
 
-static void vk_destroy_buffer(vk_buffer* b)
+static void vk_destroy_buffer_impl(vk_buffer* b)
 {
     if (s_eb_pending) vk_eng_flush();
     if (b->ptr) pvkUnmapMemory(s_vk.device, b->mem);
@@ -587,7 +636,7 @@ static void vk_cmd_after_everything(VkCommandBuffer cb)
                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-static int vk_begin(void)
+static int vk_begin_impl(void)
 {
     if (s_eb_pending) vk_eng_flush();
     VK_CHECK(pvkResetCommandBuffer(s_vk.cmd, 0), "vkResetCommandBuffer");
@@ -601,14 +650,17 @@ static int vk_begin(void)
     return 0;
 }
 
-static int vk_submit_and_wait(void)
+static int vk_submit_and_wait_impl(void)
 {
     VK_CHECK(pvkEndCommandBuffer(s_vk.cmd), "vkEndCommandBuffer");
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
     VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
     VK_CHECK(vk_queue_submit(&si, s_vk.fence), "vkQueueSubmit");
+    const uint64_t ft_w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    if (ft_w0) { const uint64_t w1 = ps3_ft_now();
+                 if (w1 - ft_w0 >= ps3_ft_min_ns()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 0, s_vk_ft_why, ft_w0, w1); }
     return 0;
 }
 
@@ -3338,9 +3390,23 @@ static VkRenderPass vk_eng_render_pass(VkFormat cf, u32 n)
     VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
                                  .colorAttachmentCount = n, .pColorAttachments = cref,
                                  .pDepthStencilAttachment = &dref };
+    /* Earlier commands' attachment writes, and their shader reads (a target
+     * sampled by an earlier draw and rendered to by this one), before this
+     * pass touches its attachments. Batched draws that skip the full barrier
+     * (vk_eng_draw, VK_DRAW_BARRIER_TRACK) rely on it. */
+    const VkPipelineStageFlags att_stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubpassDependency dep = {
+        .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
+        .srcStageMask = att_stages | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        .dstStageMask = att_stages,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT };
     VkRenderPassCreateInfo rci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
                                    .attachmentCount = n + 1, .pAttachments = att,
-                                   .subpassCount = 1, .pSubpasses = &sub };
+                                   .subpassCount = 1, .pSubpasses = &sub,
+                                   .dependencyCount = 1, .pDependencies = &dep };
     if (pvkCreateRenderPass(s_vk.device, &rci, NULL, &s_e2.rp[fi][n]) != VK_SUCCESS)
         s_e2.rp[fi][n] = VK_NULL_HANDLE;
     return s_e2.rp[fi][n];
@@ -4018,6 +4084,15 @@ static struct {
     unsigned long long draws, flushes;
 } s_eb = { .on = -1 };
 
+/* Barrier tracking for batched draws: see VK_DRAW_BARRIER_TRACK above vk_eng_draw. */
+#define VK_EB_DIRTY_MAX 32u
+static struct {
+    u32     after_draw;              /* s_eb_pending right after the last batched draw */
+    u32     ndirty, overflow;
+    VkImage dirty[VK_EB_DIRTY_MAX];
+    unsigned long long skipped, kept;
+} s_eb_hz;
+
 static int vk_eb_on(void)
 {
     if (s_eb.on >= 0) return s_eb.on;
@@ -4098,15 +4173,18 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
     return 0;
 }
 
-static void vk_eng_flush(void)
+static void vk_eng_flush_impl(void)
 {
     if (!s_eb_pending) return;
     s_eb_pending = 0;               /* first: the submit below must not re-enter */
     vk_submit_and_wait();
+    vk_grave_empty();
+    s_eb_hz.after_draw = 0; s_eb_hz.ndirty = 0; s_eb_hz.overflow = 0;
     s_eb.vb_head = s_eb.ib_head = s_eb.ub_head = s_eb.sb_head = 0;
     if (s_eb.sets) { pvkResetDescriptorPool(s_vk.device, s_eb.pool, 0); s_eb.sets = 0; }
     if ((++s_eb.flushes & 0x3FFFu) == 0)
-        VK_LOG("draw batching: %llu draws in %llu submissions\n", s_eb.draws, s_eb.flushes);
+        VK_LOG("draw batching: %llu draws in %llu submissions, barrier before %llu, skipped for %llu\n",
+               s_eb.draws, s_eb.flushes, s_eb_hz.kept, s_eb_hz.skipped);
 }
 
 static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSize bytes, VkDeviceSize align)
@@ -4176,6 +4254,55 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
     return set;
 }
 
+/* VK_DRAW_BARRIER_TRACK (default on; =0 for the old behaviour): a batched
+ * draw used to start with a full ALL_COMMANDS memory barrier, which drains
+ * the GPU before every draw -- ~12 us of bubble each on an RTX 5060, so a
+ * 512-draw batch took ~6 ms on the GPU while the FIFO thread waited for it
+ * (LittleBigPlanet 2: 10 ms of every ~55 ms frame). The barrier is needed only
+ * when the draw samples an image rendered to since the last one, or when
+ * something other than a draw (clear, upload, snapshot, conversion) was
+ * recorded in between; attachment ordering between draws comes from the
+ * engine render pass's external dependency. `dirty` holds the attachments
+ * written since the last full barrier of the open batch. */
+/* s_eb_hz: declared next to s_eb. */
+
+static int vk_eb_track_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("VK_DRAW_BARRIER_TRACK"); on = !(e && *e == '0'); }
+    return on;
+}
+
+static VkImage vk_eng_tex_image(u32 h)
+{
+    if (!h || h >= VK_ENG_MAX_OBJ) return VK_NULL_HANDLE;
+    const vk_eng_obj* o = &s_eobj[h];
+    if (o->kind == VK_ENG_VIEW)
+        return (o->surface && o->surface < VK_ENG_MAX_OBJ) ? s_eobj[o->surface].im.img : VK_NULL_HANDLE;
+    return o->im.img;
+}
+
+static void vk_eb_dirty_add(VkImage img)
+{
+    if (!img) return;
+    for (u32 i = 0; i < s_eb_hz.ndirty; i++) if (s_eb_hz.dirty[i] == img) return;
+    if (s_eb_hz.ndirty < VK_EB_DIRTY_MAX) s_eb_hz.dirty[s_eb_hz.ndirty++] = img;
+    else s_eb_hz.overflow = 1;
+}
+
+/* Does this batched draw need the full barrier in front of it? */
+static int vk_eb_draw_needs_barrier(void)
+{
+    if (!vk_eb_track_on() || !s_eb_pending || s_eb_pending != s_eb_hz.after_draw || s_eb_hz.overflow)
+        return 1;
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
+        if (!((s_e2.tex_mask >> u) & 1u)) continue;
+        const VkImage img = vk_eng_tex_image(s_e2.tex[u]);
+        for (u32 i = 0; i < s_eb_hz.ndirty; i++) if (s_eb_hz.dirty[i] == img) return 1;
+    }
+    return 0;
+}
+
 static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
                         u32 stride, const u32* indices, u32 index_count)
 {
@@ -4217,6 +4344,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     VkDescriptorSet set = VK_NULL_HANDLE;
     const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
     int batched = vk_eb_on() && vbytes <= VK_EB_VB_BYTES && ibytes <= VK_EB_IB_BYTES;
+    int full_barrier = 1;
     if (batched && P->cube_mask && !vk_eng_dummy_cube_view()) return;   /* may flush: before any slice */
     if (batched) {
         /* Slices of the rings and a set from the pool; a full one flushes the
@@ -4252,10 +4380,12 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         memcpy((u8*)s_eb.vb.ptr + voff, vertices, (size_t)vbytes);
         if (ibytes) memcpy((u8*)s_eb.ib.ptr + ioff, indices, (size_t)ibytes);
         vbuf = s_eb.vb.buf; ibuf = s_eb.ib.buf;
-        if (!s_eb_pending && vk_begin()) return;
         /* Earlier draws of this batch may have rendered what this one samples
-         * or blends over: order it after all of them. */
-        vk_cmd_after_everything(s_vk.cmd);
+         * or blends over: order it after all of them, unless nothing it
+         * samples was rendered since the last barrier (see s_eb_hz). */
+        full_barrier = vk_eb_draw_needs_barrier();
+        if (!s_eb_pending && vk_begin()) return;
+        if (full_barrier) { vk_cmd_after_everything(s_vk.cmd); s_eb_hz.ndirty = 0; s_eb_hz.overflow = 0; }
     } else {
         if (s_eb_pending) vk_eng_flush();
         if (vk_ensure_vertex_buffer(vbytes)) return;
@@ -4274,8 +4404,14 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     }
     /* Everything submitted before is complete (each submission is waited
      * on); this orders memory for the surfaces this draw touches. */
-    for (u32 i = 0; i < n; i++)
-        vk_barrier_image(s_eobj[s_eng_bound.rt[i]].im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    if (full_barrier)
+        for (u32 i = 0; i < n; i++)
+            vk_barrier_image(s_eobj[s_eng_bound.rt[i]].im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    if (batched) {
+        for (u32 i = 0; i < n; i++) vk_eb_dirty_add(s_eobj[s_eng_bound.rt[i]].im.img);
+        vk_eb_dirty_add(zo && dview == zo->im.view ? zo->im.img : VK_NULL_HANDLE);
+        if (full_barrier) s_eb_hz.kept++; else s_eb_hz.skipped++;
+    }
     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                                   .renderPass = rp, .framebuffer = fb,
                                   .renderArea = { { 0, 0 }, { w, h } } };
@@ -4312,7 +4448,8 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     pvkCmdEndRenderPass(s_vk.cmd);
     if (!batched) { vk_submit_and_wait(); return; }
     s_eb.draws++;
-    if (++s_eb_pending >= s_eb.max_draws) vk_eng_flush();
+    s_eb_hz.after_draw = ++s_eb_pending;
+    if (s_eb_pending >= s_eb.max_draws) vk_eng_flush();
 }
 
 static const rsx_draw_backend s_vk_engine_backend = {
