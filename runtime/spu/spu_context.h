@@ -1089,6 +1089,35 @@ void spu_direct_init(void);
  * host-frame return as SPU_RET, publishing the register actually branched. */
 #define SPU_RET_REG(ctx, n) do {                                       (ctx)->pc = (ctx)->gpr[n]._u32[0];                             if ((ctx)->host_depth == 0)                                        g_spu_trampoline_fn = spu_indirect_branch;                 return;                                                    } while (0)
 
+/* SPU_WRCH_INLINE (opt-in, for a title's lifted SPU sources): the MFC parameter channels
+ * (LSA, EAH, EAL, size, tag id, tag mask) only latch a value in the context -- spu_wrch's own
+ * first switch does exactly this and returns. Five or six of the seven or eight writes of every
+ * DMA are such writes, and each was a call into spu_wrch with its whole prologue (a large
+ * frame, six saved registers, the stack canary). With SPU_WRCH_INLINE the lifted code stores
+ * them directly and calls spu_wrch for every other channel. The only difference: SPU_CHHIST
+ * no longer counts those writes. Off by default, as the tests define their own spu_wrch. The
+ * generated headers' `void spu_wrch(...)` declaration then names the static inline below,
+ * which C and C++ allow (the earlier static declaration gives the linkage); the real function
+ * is reached through an asm label (ELF: no symbol prefix). */
+#if defined(SPU_WRCH_INLINE) && defined(__ELF__) && (defined(__GNUC__) || defined(__clang__))
+void spu_wrch_extern(spu_context* ctx, uint32_t channel, u128 value) __asm__("spu_wrch");
+static inline __attribute__((always_inline)) void spu_wrch_inline(spu_context* ctx, uint32_t channel,
+                                                                  u128 value)
+{
+    const uint32_t v = value._u32[0];    /* channel writes use the preferred slot */
+    switch (channel) {
+    case MFC_LSA:       ctx->mfc_lsa = v;         return;
+    case MFC_EAH:       ctx->mfc_eah = v;         return;
+    case MFC_EAL:       ctx->mfc_eal = v;         return;
+    case MFC_Size:      ctx->mfc_size = v;        return;
+    case MFC_TagID:     ctx->mfc_tag = v & 0x1F;  return;
+    case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
+    default:            spu_wrch_extern(ctx, channel, value); return;
+    }
+}
+#define spu_wrch spu_wrch_inline   /* object-like: the generated prototype must still parse */
+#endif
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
