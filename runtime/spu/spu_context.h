@@ -568,7 +568,16 @@ static inline __m128i spu_ls_bswap_words(__m128i x) {
  * words and ctx->image_id/policy_mode/ls cannot be kept in registers across
  * them. Three gates (probe word, image_id==2 && policy_mode, watch count) were
  * 4 loads and 3 branches per lqd in a retail title's hottest job; one is a
- * load and a branch. */
+ * load and a branch.
+ *
+ * -DSPU_LS_NO_DIAG (for the lifted sources of a title build) drops that gate
+ * too: SPU_LS_LOWREAD, SPU_LS_WATCH, SPU_SMC_WATCH and SPU_WWS_PROBE then see
+ * no lqd/stqd from those sources (DMA and the interpreter still check). */
+#if defined(SPU_LS_NO_DIAG)
+#  define SPU_LS_DIAG_ARMED(gate) 0
+#else
+#  define SPU_LS_DIAG_ARMED(gate) __builtin_expect((gate) != 0, 0)
+#endif
 
 /* The diagnostic gates the inline helpers below read. Defined here rather than
  * in spu_channels.c, as one merged definition per program (selectany / weak),
@@ -644,7 +653,7 @@ static SPU_NOINLINE_COLD void spu_ls_read_diag(const spu_context* ctx, uint32_t 
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
-    if (__builtin_expect(g_spu_ls_rdiag != 0, 0))
+    if (SPU_LS_DIAG_ARMED(g_spu_ls_rdiag))
         spu_ls_read_diag(ctx, lsa);
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
@@ -765,7 +774,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
-    if (__builtin_expect(g_spu_ls_wdiag != 0, 0))
+    if (SPU_LS_DIAG_ARMED(g_spu_ls_wdiag))
         spu_ls_write_diag(ctx, lsa, val);
 }
 
