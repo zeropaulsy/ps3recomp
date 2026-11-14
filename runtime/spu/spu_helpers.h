@@ -803,10 +803,13 @@ SPU__SF_V3(spu__fnms_s, spu__fma_any(x, y, z, 0x80000000u, 0))
  * fma is one fused op with FMA3. Without it, the product of two 24-bit significands is exact in
  * double, the add truncates once at 53 bits and the narrowing truncates again at 24; truncation
  * onto nested grids equals one truncation, and a value below 2^-126 stays below it and flushes.
- * The mode is read with stmxcsr in a plain asm with no side effects, so the compiler hoists and
- * shares it; it changes only in spu_run_with_halt, outside generated code (and in SPU__DP_RN,
- * which puts it back). test_spu_float_mode_x86 checks every float helper for the same bits in
- * both modes. */
+ * The mode changes only in spu_run_with_halt, outside generated code (and in SPU__DP_RN, which
+ * puts it back). On ELF targets the helpers read it from a thread-local byte that
+ * spu_float_mode_enter/leave keep in step with MXCSR (spu_float_mode_note): GCC did not share the
+ * stmxcsr asm the way it was meant to (64 copies in LBP2's hottest job function), and stmxcsr is
+ * slow (2 uops, low throughput on Zen) where the byte is one load. Code that sets MXCSR itself
+ * (the tests) calls spu_float_mode_note too. Elsewhere, or with -DSPU_XR_STMXCSR, the helpers read
+ * MXCSR. test_spu_float_mode_x86 checks every float helper for the same bits in both modes. */
 #include <smmintrin.h>
 #if defined(__AVX2__) || defined(__FMA__)
 #include <immintrin.h>
@@ -814,8 +817,16 @@ SPU__SF_V3(spu__fnms_s, spu__fma_any(x, y, z, 0x80000000u, 0))
 #define SPU_MXCSR_RZFZ 0xFFC0u   /* FZ (bit 15), RC = 11 (13-14), exceptions masked (7-12), DAZ (6) */
 #define SPU__XR_INLINE static inline __attribute__((always_inline))
 #define SPU__XR_SLOW   static __attribute__((noinline, cold, unused))
+#if defined(__ELF__) && !defined(SPU_XR_STMXCSR)
+/* Weak so that a test built from this header alone links; the runtime's objects share one copy. */
+__attribute__((weak)) __thread unsigned char spu__xr_mode;
+SPU__XR_INLINE int spu__xr_on(void) { return spu__xr_mode; }
+SPU__XR_INLINE void spu_float_mode_note(int rz) { spu__xr_mode = (unsigned char)(rz != 0); }
+#else
 SPU__XR_INLINE int spu__xr_on(void) {
     unsigned v; __asm__("stmxcsr %0" : "=m"(v)); return (v & 0xFFC0u) == SPU_MXCSR_RZFZ; }
+SPU__XR_INLINE void spu_float_mode_note(int rz) { (void)rz; }
+#endif
 SPU__XR_INLINE __m128i spu__xr_ld(u128 a) { return _mm_loadu_si128((const __m128i*)a._u32); }
 SPU__XR_INLINE u128 spu__xr_st(__m128i v) { u128 r; _mm_storeu_si128((__m128i*)r._u32, v); return r; }
 SPU__XR_INLINE __m128i spu__xr_z(__m128i x) {          /* biased exponent 0: an SPU zero */

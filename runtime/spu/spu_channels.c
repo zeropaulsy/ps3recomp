@@ -270,6 +270,7 @@ static uint64_t spu_float_mode_enter(void)
     const unsigned v = _mm_getcsr();
     if ((v & 0xFFC0u) == SPU_MXCSR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
     _mm_setcsr(SPU_MXCSR_RZFZ | (v & 0x3Fu));            /* keep the sticky exception flags */
+    spu_float_mode_note(1);
     return v;
 #else
     return ~0ull;
@@ -280,7 +281,7 @@ static void spu_float_mode_leave(uint64_t outer)
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
     if (outer != ~0ull) __asm__ volatile("msr fpcr, %0" :: "r"(outer));
 #elif (defined(__x86_64__) || defined(__i386__)) && defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS)
-    if (outer != ~0ull) _mm_setcsr((unsigned)outer);
+    if (outer != ~0ull) { _mm_setcsr((unsigned)outer); spu_float_mode_note(0); }
 #else
     (void)outer;
 #endif

@@ -113,12 +113,12 @@ static long s_bad[OP_N], s_lanes[OP_N], s_mode_bad;
 static void batch(int op, int n)
 {
     const unsigned outer = _mm_getcsr();
-    _mm_setcsr(0x1F80u);
+    _mm_setcsr(0x1F80u); spu_float_mode_note(0);
     run(op, s_out[0], n);
-    _mm_setcsr(SPU_MXCSR_RZFZ);
+    _mm_setcsr(SPU_MXCSR_RZFZ); spu_float_mode_note(1);
     run(op, s_out[1], n);
     if ((_mm_getcsr() & ~0x3Fu) != (SPU_MXCSR_RZFZ & ~0x3Fu)) s_mode_bad++;   /* helpers restore it */
-    _mm_setcsr(outer);
+    _mm_setcsr(outer); spu_float_mode_note(0);
     for (int k = 0; k < n; k++) {
         s_lanes[op] += 4;
         for (int i = 0; i < 4; i++)

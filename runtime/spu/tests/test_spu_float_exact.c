@@ -181,10 +181,10 @@ static void fpcr_set(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
 #define SPU_TEST_RZ 1
 #include <xmmintrin.h>
 static uint64_t fpcr_get(void) { return _mm_getcsr(); }
-static void fpcr_set(uint64_t v) { _mm_setcsr((unsigned)v); }
 #define RZ_MODE SPU_MXCSR_RZFZ
 #define DEFAULT_MODE 0x1F80u
 #define MODE_IS_RZ(v) (((v) & 0xFFC0u) == SPU_MXCSR_RZFZ)
+static void fpcr_set(uint64_t v) { _mm_setcsr((unsigned)v); spu_float_mode_note(MODE_IS_RZ(v)); }
 /* SPU_FLOAT_RZ: double precision and frds must give the default-FPCR answer on a thread whose
  * FPCR is round toward zero with flush-to-zero; FPCR must be back afterwards. */
 static long dp_under_rz(long n)
