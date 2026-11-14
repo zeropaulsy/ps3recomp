@@ -19,6 +19,18 @@
 #include <string.h>
 #include <math.h>
 
+/* x86 vector paths (SSE4.1; vmaddfp / vnmsubfp also need FMA). Each one is bit-identical to the scalar
+ * loop it replaces (kept as name_s, the reference and the cold path): it runs only with VSCR[NJ] clear
+ * and hands the whole vector to the scalar loop when a result lane is NaN, so the NaN rules stay in
+ * one place. Words are byte-swapped in place (pshufb), so element i stays in word i. Define
+ * VMX_NO_SIMD to force the scalar loops. */
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__)) && defined(__SSE4_1__) && !defined(VMX_NO_SIMD)
+#define VMX_X86 1
+#include <immintrin.h>
+#else
+#define VMX_X86 0
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -26,6 +38,41 @@ extern "C" {
 #define VMX_SAT 0x00000001u
 #define VMX_NJ  0x00010000u
 #define VMX_INL static inline
+#if defined(__GNUC__)
+#define VMX_COLD static __attribute__((noinline, cold, unused))
+#define VMX_LIKELY(x) __builtin_expect(!!(x), 1)
+#else
+#define VMX_COLD static
+#define VMX_LIKELY(x) (x)
+#endif
+/* Hides a float (or vector) value from the optimiser. GCC folds -fma(x, z, -y) into fnma, -(x*z) + y,
+ * which gives +0 instead of -0 when x*z == y exactly (GCC 15 does it even with signed zeros honoured
+ * and -ffp-contract=off); vnmsubfp passes its fma result through this before negating. */
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__)) && defined(__SSE2__)
+#define VMX_OPAQUE(v) __asm__("" : "+x"(v))
+#elif defined(__GNUC__) && defined(__aarch64__)
+#define VMX_OPAQUE(v) __asm__("" : "+w"(v))
+#elif defined(__GNUC__)
+#define VMX_OPAQUE(v) __asm__("" : "+m"(v))
+#else
+#define VMX_OPAQUE(v) ((void)0)
+#endif
+
+#if VMX_X86
+VMX_INL __m128i vmx_bsv(__m128i v) {
+    return _mm_shuffle_epi8(v, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12));
+}
+VMX_INL __m128i vmx_ldi(const void* p) { return vmx_bsv(_mm_loadu_si128((const __m128i*)p)); }
+VMX_INL __m128 vmx_ldf(const void* p) { return _mm_castsi128_ps(vmx_ldi(p)); }
+VMX_INL void vmx_stf(void* p, __m128 v) { _mm_storeu_si128((__m128i*)p, vmx_bsv(_mm_castps_si128(v))); }
+VMX_INL int vmx_anynan(__m128 v) { return _mm_movemask_ps(_mm_cmpunord_ps(v, v)); }
+/* a word-mask result: all-ones / zero words read the same in either byte order */
+VMX_INL uint32_t vmx_stmask(void* p, __m128i m) {
+    _mm_storeu_si128((__m128i*)p, m);
+    const int k = _mm_movemask_ps(_mm_castsi128_ps(m));
+    return (uint32_t)((k == 15) << 3 | (k == 0) << 1);
+}
+#endif
 
 /* ---- element access (big-endian) ---- */
 VMX_INL uint16_t vmx_h(const uint8_t* v, int i) { return (uint16_t)(v[2 * i] << 8 | v[2 * i + 1]); }
@@ -270,10 +317,40 @@ VMX_INL float vmx_minf(float x, float y) {
     if (x == 0 && y == 0) return signbit(x) ? x : y;      /* min(-0,+0) = -0 */
     return x < y ? x : y;
 }
-VMX_FBIN(vmx_vaddfp, vmx_f(x) + vmx_f(y), 1)
-VMX_FBIN(vmx_vsubfp, vmx_f(x) - vmx_f(y), 1)
-VMX_FBIN(vmx_vmaxfp, vmx_maxf(vmx_f(x), vmx_f(y)), 0)
-VMX_FBIN(vmx_vminfp, vmx_minf(vmx_f(x), vmx_f(y)), 0)
+VMX_FBIN(vmx_vaddfp_s, vmx_f(x) + vmx_f(y), 1)
+VMX_FBIN(vmx_vsubfp_s, vmx_f(x) - vmx_f(y), 1)
+#if VMX_X86
+/* No NaN in the result means no NaN operand, and with NJ clear the flushes are no-ops. */
+#define VMX_FBIN_V(name, vop) \
+VMX_COLD void name##_cold(VMX_D, VMX_A, VMX_B, uint32_t vscr) { name##_s(d_, a_, b_, vscr); } \
+VMX_INL void name(VMX_D, VMX_A, VMX_B, uint32_t vscr) { \
+    if (VMX_LIKELY(!(vscr & VMX_NJ))) { const __m128 r = vop(vmx_ldf(a_), vmx_ldf(b_)); \
+        if (VMX_LIKELY(!vmx_anynan(r))) { vmx_stf(d_, r); return; } } \
+    name##_cold(d_, a_, b_, vscr); }
+VMX_FBIN_V(vmx_vaddfp, _mm_add_ps)
+VMX_FBIN_V(vmx_vsubfp, _mm_sub_ps)
+#else
+VMX_INL void vmx_vaddfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) { vmx_vaddfp_s(d_, a_, b_, vscr); }
+VMX_INL void vmx_vsubfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) { vmx_vsubfp_s(d_, a_, b_, vscr); }
+#endif
+VMX_FBIN(vmx_vmaxfp_s, vmx_maxf(vmx_f(x), vmx_f(y)), 0)
+VMX_FBIN(vmx_vminfp_s, vmx_minf(vmx_f(x), vmx_f(y)), 0)
+#if VMX_X86
+/* maxps / minps return the second operand on a tie or a NaN, so a NaN operand goes to the scalar loop
+ * and the ordered max/min is taken both ways round: AND keeps +0 for max(-0,+0), OR keeps -0 for min. */
+#define VMX_MINMAX_V(name, vop, comb) \
+VMX_COLD void name##_cold(VMX_D, VMX_A, VMX_B, uint32_t vscr) { name##_s(d_, a_, b_, vscr); } \
+VMX_INL void name(VMX_D, VMX_A, VMX_B, uint32_t vscr) { \
+    const __m128 x = vmx_ldf(a_), y = vmx_ldf(b_); \
+    if (VMX_LIKELY(!(vscr & VMX_NJ) && !_mm_movemask_ps(_mm_cmpunord_ps(x, y)))) { \
+        vmx_stf(d_, comb(vop(x, y), vop(y, x))); return; } \
+    name##_cold(d_, a_, b_, vscr); }
+VMX_MINMAX_V(vmx_vmaxfp, _mm_max_ps, _mm_and_ps)
+VMX_MINMAX_V(vmx_vminfp, _mm_min_ps, _mm_or_ps)
+#else
+VMX_INL void vmx_vmaxfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) { vmx_vmaxfp_s(d_, a_, b_, vscr); }
+VMX_INL void vmx_vminfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) { vmx_vminfp_s(d_, a_, b_, vscr); }
+#endif
 
 /* Fused multiply-add without a libm call per lane. Without -mfma, fmaf is a
  * software routine on MinGW, and vmaddfp/vnmsubfp called it once per lane. The
@@ -296,24 +373,56 @@ VMX_INL float vmx_fmaf(float x, float z, float y) {
     return fmaf(x, z, y);
 #endif
 }
-VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
+VMX_INL void vmx_vmaddfp_s(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
         vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(vmx_fmaf(x, z, y))), vscr)); } VMX_OUT; }
-VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
+VMX_INL void vmx_vnmsubfp_s(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
-        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(-vmx_fmaf(x, z, -y))), vscr)); } VMX_OUT; }
+        float t = vmx_fmaf(x, z, -y); VMX_OPAQUE(t);
+        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(-t)), vscr)); } VMX_OUT; }
+#if VMX_X86 && defined(__FMA__)
+/* vfmadd*ps rounds once, exactly like fmaf. vnmsubfp stays -(x*z - y) (see VMX_OPAQUE). */
+#define VMX_FMA_V(name, expr) \
+VMX_COLD void name##_cold(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { name##_s(d_, a_, b_, c_, vscr); } \
+VMX_INL void name(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { \
+    if (VMX_LIKELY(!(vscr & VMX_NJ))) { const __m128 x = vmx_ldf(a_), y = vmx_ldf(b_), z = vmx_ldf(c_); \
+        const __m128 r = (expr); \
+        if (VMX_LIKELY(!vmx_anynan(r))) { vmx_stf(d_, r); return; } } \
+    name##_cold(d_, a_, b_, c_, vscr); }
+VMX_FMA_V(vmx_vmaddfp, _mm_fmadd_ps(x, z, y))
+VMX_INL __m128 vmx_nmsubv(__m128 x, __m128 z, __m128 y) {
+    __m128 t = _mm_fmsub_ps(x, z, y); VMX_OPAQUE(t);
+    return _mm_xor_ps(t, _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u))); }
+VMX_FMA_V(vmx_vnmsubfp, vmx_nmsubv(x, z, y))
+#else
+VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { vmx_vmaddfp_s(d_, a_, b_, c_, vscr); }
+VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { vmx_vnmsubfp_s(d_, a_, b_, c_, vscr); }
+#endif
 
 #define VMX_FUN(name, expr, flush_in, nanmode) \
 VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16]; \
     for (int i = 0; i < 4; i++) { uint32_t y = vmx_w(b, i); if (flush_in) y = vmx_flush(y, vscr); \
         float f = vmx_f(y); uint32_t z = vmx_u(expr); \
         vmx_sw(r, i, nanmode == 2 ? vmx_flush(vmx_vnan1(z, y), vscr) : vmx_fix(z)); } VMX_OUT; }
-VMX_FUN(vmx_vrefp, 1.0f / f, 1, 2)
-VMX_FUN(vmx_vrsqrtefp, 1.0f / sqrtf(f), 1, 2)
+VMX_FUN(vmx_vrefp_s, 1.0f / f, 1, 2)
+VMX_FUN(vmx_vrsqrtefp_s, 1.0f / sqrtf(f), 1, 2)
+#if VMX_X86
+#define VMX_FUN_V(name, expr) \
+VMX_COLD void name##_cold(VMX_D, VMX_B, uint32_t vscr) { name##_s(d_, b_, vscr); } \
+VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { \
+    if (VMX_LIKELY(!(vscr & VMX_NJ))) { const __m128 f = vmx_ldf(b_), r = (expr); \
+        if (VMX_LIKELY(!vmx_anynan(r))) { vmx_stf(d_, r); return; } } \
+    name##_cold(d_, b_, vscr); }
+VMX_FUN_V(vmx_vrefp, _mm_div_ps(_mm_set1_ps(1.0f), f))
+VMX_FUN_V(vmx_vrsqrtefp, _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(f)))
+#else
+VMX_INL void vmx_vrefp(VMX_D, VMX_B, uint32_t vscr) { vmx_vrefp_s(d_, b_, vscr); }
+VMX_INL void vmx_vrsqrtefp(VMX_D, VMX_B, uint32_t vscr) { vmx_vrsqrtefp_s(d_, b_, vscr); }
+#endif
 VMX_FUN(vmx_vexptefp, exp2f(f), 0, 1)
 VMX_FUN(vmx_vlogefp, log2f(f), 0, 1)
 VMX_FUN(vmx_vrfin, nearbyintf(f), 0, 2)      /* host default rounding: to nearest even */
@@ -356,16 +465,34 @@ VMX_INL void vmx_sh64(uint8_t* v, int i, uint64_t x) { vmx_sh(v, i, (uint16_t)x)
 VMX_INL void vmx_sw64(uint8_t* v, int i, uint64_t x) { vmx_sw(v, i, (uint32_t)x); }
 VMX_CMP(vmx_vcmpequb, 16, vmx_b, vmx_sb64, x == y)
 VMX_CMP(vmx_vcmpequh, 8, vmx_h, vmx_sh64, x == y)
-VMX_CMP(vmx_vcmpequw, 4, vmx_w, vmx_sw64, x == y)
+VMX_CMP(vmx_vcmpequw_s, 4, vmx_w, vmx_sw64, x == y)
 VMX_CMP(vmx_vcmpgtub, 16, vmx_b, vmx_sb64, x > y)
 VMX_CMP(vmx_vcmpgtuh, 8, vmx_h, vmx_sh64, x > y)
-VMX_CMP(vmx_vcmpgtuw, 4, vmx_w, vmx_sw64, x > y)
+VMX_CMP(vmx_vcmpgtuw_s, 4, vmx_w, vmx_sw64, x > y)
 VMX_CMP(vmx_vcmpgtsb, 16, vmx_b, vmx_sb64, (int8_t)x > (int8_t)y)
 VMX_CMP(vmx_vcmpgtsh, 8, vmx_h, vmx_sh64, (int16_t)x > (int16_t)y)
-VMX_CMP(vmx_vcmpgtsw, 4, vmx_w, vmx_sw64, (int32_t)x > (int32_t)y)
-VMX_CMP(vmx_vcmpeqfp, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) == vmx_f((uint32_t)y))
-VMX_CMP(vmx_vcmpgefp, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) >= vmx_f((uint32_t)y))
-VMX_CMP(vmx_vcmpgtfp, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) > vmx_f((uint32_t)y))
+VMX_CMP(vmx_vcmpgtsw_s, 4, vmx_w, vmx_sw64, (int32_t)x > (int32_t)y)
+VMX_CMP(vmx_vcmpeqfp_s, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) == vmx_f((uint32_t)y))
+VMX_CMP(vmx_vcmpgefp_s, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) >= vmx_f((uint32_t)y))
+VMX_CMP(vmx_vcmpgtfp_s, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) > vmx_f((uint32_t)y))
+#if VMX_X86
+/* word compares: an all-ones / zero result word is the same in either byte order */
+VMX_INL __m128i vmx_cmpgtu32(__m128i x, __m128i y) {
+    const __m128i s = _mm_set1_epi32((int)0x80000000u);
+    return _mm_cmpgt_epi32(_mm_xor_si128(x, s), _mm_xor_si128(y, s));
+}
+VMX_INL uint32_t vmx_vcmpequw(VMX_D, VMX_A, VMX_B) {
+    return vmx_stmask(d_, _mm_cmpeq_epi32(_mm_loadu_si128((const __m128i*)a_), _mm_loadu_si128((const __m128i*)b_))); }
+VMX_INL uint32_t vmx_vcmpgtuw(VMX_D, VMX_A, VMX_B) { return vmx_stmask(d_, vmx_cmpgtu32(vmx_ldi(a_), vmx_ldi(b_))); }
+VMX_INL uint32_t vmx_vcmpgtsw(VMX_D, VMX_A, VMX_B) { return vmx_stmask(d_, _mm_cmpgt_epi32(vmx_ldi(a_), vmx_ldi(b_))); }
+VMX_INL uint32_t vmx_vcmpeqfp(VMX_D, VMX_A, VMX_B) { return vmx_stmask(d_, _mm_castps_si128(_mm_cmpeq_ps(vmx_ldf(a_), vmx_ldf(b_)))); }
+VMX_INL uint32_t vmx_vcmpgefp(VMX_D, VMX_A, VMX_B) { return vmx_stmask(d_, _mm_castps_si128(_mm_cmpge_ps(vmx_ldf(a_), vmx_ldf(b_)))); }
+VMX_INL uint32_t vmx_vcmpgtfp(VMX_D, VMX_A, VMX_B) { return vmx_stmask(d_, _mm_castps_si128(_mm_cmpgt_ps(vmx_ldf(a_), vmx_ldf(b_)))); }
+#else
+#define VMX_CMP_FWD(n) VMX_INL uint32_t n(VMX_D, VMX_A, VMX_B) { return n##_s(d_, a_, b_); }
+VMX_CMP_FWD(vmx_vcmpequw) VMX_CMP_FWD(vmx_vcmpgtuw) VMX_CMP_FWD(vmx_vcmpgtsw)
+VMX_CMP_FWD(vmx_vcmpeqfp) VMX_CMP_FWD(vmx_vcmpgefp) VMX_CMP_FWD(vmx_vcmpgtfp)
+#endif
 /* vcmpbfp: bit 31 = !(a <= b), bit 30 = !(a >= -b); CR6 EQ = every lane in bounds */
 VMX_INL uint32_t vmx_vcmpbfp(VMX_D, VMX_A, VMX_B) { VMX_ARGS_PREP; int inb = 1;
     for (int i = 0; i < 4; i++) { float x = vmx_f(vmx_w(a, i)), y = vmx_f(vmx_w(b, i));

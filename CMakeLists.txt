@@ -516,6 +516,25 @@ if(PS3RECOMP_BUILD_TESTS)
     add_test(NAME vmx_fmaf COMMAND test_vmx_fmaf)
     set_tests_properties(vmx_fmaf PROPERTIES TIMEOUT 120)
 
+    # ppu_vmx.h's x86 vector paths against the scalar loops, bit for bit: SSE4.1
+    # only (the FMA ops stay scalar) and AVX2+FMA (skips itself without FMA).
+    if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        foreach(_vmx_variant IN ITEMS sse41 fma)
+            add_executable(test_vmx_simd_${_vmx_variant} tests/test_vmx_simd.c)
+            target_compile_options(test_vmx_simd_${_vmx_variant} PRIVATE -UNDEBUG -O2 -ffp-contract=off)
+            if(_vmx_variant STREQUAL "fma")
+                target_compile_options(test_vmx_simd_${_vmx_variant} PRIVATE -mavx2 -mfma)
+            else()
+                target_compile_options(test_vmx_simd_${_vmx_variant} PRIVATE -msse4.1 -mno-fma)
+            endif()
+            if(NOT WIN32)
+                target_link_libraries(test_vmx_simd_${_vmx_variant} PRIVATE m)
+            endif()
+            add_test(NAME vmx_simd_${_vmx_variant} COMMAND test_vmx_simd_${_vmx_variant})
+            set_tests_properties(vmx_simd_${_vmx_variant} PROPERTIES TIMEOUT 300)
+        endforeach()
+    endif()
+
     # Current colors are explicit shader inputs even when they equal the
     # hardware default; exercise both compact fetch entry points without a GPU.
     add_executable(test_vertex_current_color
