@@ -1802,8 +1802,10 @@ static inline u128 spu_frest_ref(u128 a) {
 #if defined(__AVX2__) && !defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
 /* The estimate, interpolate and conversion instructions four lanes at a time. Every lane rule
  * above is integer work on the bit fields, so these are exact by construction: no lane falls
- * back. cuflt/csflt read the integer's top bit and next 23 bits from its (exact) double. test_spu_float_est.c
- * checks each one against the scalar reference. */
+ * back. cuflt/csflt read the integer's top bit and next 23 bits from its (exact) double. For the
+ * scales code uses, cflts/csflt/cuflt instead take the host conversions, arranged so that no
+ * step rounds and the MXCSR mode does not matter. test_spu_float_est.c checks each one against
+ * the scalar reference, in the default and in the SPU MXCSR. */
 #include <immintrin.h>
 #define SPU__XE_INLINE static inline __attribute__((always_inline))
 SPU__XE_INLINE __m128i spu__xe_ld(u128 a) { return _mm_loadu_si128((const __m128i*)a._u32); }
@@ -1883,7 +1885,24 @@ SPU__XE_INLINE __m128i spu__xe_cfl(u128 a, int i8, int is_unsigned) {
     v = _mm_blendv_epi8(v, sat, _mm_cmpgt_epi32(sh, _mm_set1_epi32(7)));
     return _mm_andnot_si128(isz, v);
 }
-SPU__XE_INLINE u128 spu_cflts(u128 a, int i8) { return spu__xe_st(spu__xe_cfl(a, i8, 0)); }
+/* cflts for scales 0..127 (i8 46..173), the ones code uses, in any MXCSR mode: multiplying by
+ * 2^scale is exact or overflows (Inf, or FLT_MAX under RZ: either way >= 2^31), cvttps2dq
+ * truncates and gives 0x80000000 for |x| >= 2^31 and for NaN; a lane with a clear sign bit
+ * turns that into 0x7FFFFFFF (an SPU exponent-255 operand is Inf/NaN here, its sign is still
+ * the SPU sign). Exponent 0 is an SPU zero (a denormal can scale up to >= 1 without DAZ). */
+SPU__XE_INLINE __m128i spu__xe_cflts_cvt(u128 a, int scale) {
+    const __m128i x = spu__xe_ld(a);
+    const __m128 f = _mm_mul_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(_mm_set1_epi32((127 + scale) << 23)));
+    __m128i r = _mm_cvttps_epi32(f);
+    r = _mm_add_epi32(r, _mm_and_si128(_mm_cmpeq_epi32(r, _mm_set1_epi32((int)0x80000000u)),
+                                       _mm_cmpgt_epi32(x, _mm_set1_epi32(-1))));           /* -> 0x7FFFFFFF */
+    return _mm_andnot_si128(_mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128()), r);
+}
+SPU__XE_INLINE u128 spu_cflts(u128 a, int i8) {
+    const int scale = 173 - (i8 & 0xFF);
+    if (scale >= 0 && scale <= 127) return spu__xe_st(spu__xe_cflts_cvt(a, scale));
+    return spu__xe_st(spu__xe_cfl(a, i8, 0));
+}
 SPU__XE_INLINE u128 spu_cfltu(u128 a, int i8) { return spu__xe_st(spu__xe_cfl(a, i8, 1)); }
 /* csflt/cuflt: |v| as an exact double gives top = its exponent and the next 23 bits truncated;
  * the result exponent is top + i8 - 28 (= top + 127 - (155 - i8)), saturated / flushed. */
@@ -1898,7 +1917,23 @@ SPU__XE_INLINE __m128i spu__xe_cxflt(__m256d d, __m128i sign, __m128i nz, int i8
     const __m128i flush = _mm_cmpgt_epi32(_mm_set1_epi32(1), biased);
     return _mm_and_si128(_mm_andnot_si128(flush, r), nz);
 }
+/* csflt/cuflt for scales 0..126 (i8 29..155), the ones code uses, in any MXCSR mode: the integer
+ * as a double d is exact; clearing its low 29 fraction bits truncates it to 24 bits, so the
+ * narrowing is exact too, and so is the multiply by 2^-scale (|v| >= 1 keeps the result normal;
+ * 0 gives +0). */
+SPU__XE_INLINE u128 spu__xe_cxflt_cvt(__m256d d, int scale) {
+    d = _mm256_and_pd(d, _mm256_castsi256_pd(_mm256_set1_epi64x((long long)~0x1FFFFFFFull)));
+    const __m128 f = _mm_mul_ps(_mm256_cvtpd_ps(d), _mm_castsi128_ps(_mm_set1_epi32((127 - scale) << 23)));
+    u128 r; _mm_storeu_ps((float*)r._u32, f); return r;
+}
+/* unsigned -> double: flip the top bit, convert as signed, add 2^31 back (all exact) */
+SPU__XE_INLINE __m256d spu__xe_u32_pd(__m128i v) {
+    return _mm256_add_pd(_mm256_cvtepi32_pd(_mm_xor_si128(v, _mm_set1_epi32((int)0x80000000u))),
+                         _mm256_set1_pd(2147483648.0));
+}
 SPU__XE_INLINE u128 spu_csflt(u128 a, int i8) {
+    const int scale = 155 - (i8 & 0xFF);
+    if (scale >= 0 && scale <= 126) return spu__xe_cxflt_cvt(_mm256_cvtepi32_pd(spu__xe_ld(a)), scale);
     const __m128i v = spu__xe_ld(a);
     const __m256d d = _mm256_andnot_pd(_mm256_set1_pd(-0.0), _mm256_cvtepi32_pd(v));          /* |v|, exact */
     const __m128i sign = _mm_and_si128(v, _mm_set1_epi32((int)0x80000000u));
@@ -1907,9 +1942,9 @@ SPU__XE_INLINE u128 spu_csflt(u128 a, int i8) {
 }
 SPU__XE_INLINE u128 spu_cuflt(u128 a, int i8) {
     const __m128i v = spu__xe_ld(a);
-    /* unsigned -> double: flip the top bit, convert as signed, add 2^31 back (all exact) */
-    const __m256d d = _mm256_add_pd(_mm256_cvtepi32_pd(_mm_xor_si128(v, _mm_set1_epi32((int)0x80000000u))),
-                                    _mm256_set1_pd(2147483648.0));
+    const int scale = 155 - (i8 & 0xFF);
+    const __m256d d = spu__xe_u32_pd(v);
+    if (scale >= 0 && scale <= 126) return spu__xe_cxflt_cvt(d, scale);
     const __m128i nz = _mm_xor_si128(_mm_cmpeq_epi32(v, _mm_setzero_si128()), _mm_set1_epi32(-1));
     return spu__xe_st(spu__xe_cxflt(d, _mm_setzero_si128(), nz, i8));
 }

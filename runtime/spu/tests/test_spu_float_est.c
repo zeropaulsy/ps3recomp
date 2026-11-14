@@ -66,6 +66,10 @@ int main(void)
     puts("test_spu_float_est: no AVX2, nothing to compare");
     return 0;
 #else
+    /* every pass in the default MXCSR, then again in the SPU's (round toward zero, DAZ, FTZ):
+     * the helpers must not depend on it */
+    for (int mode = 0; mode < 2; mode++) {
+    if (mode) _mm_setcsr(_mm_getcsr() | 0x6000u | 0x8040u);
     const long N = 2000000;
     for (long it = 0; it < N; it++) {
         u128 f, g, n;
@@ -88,7 +92,9 @@ int main(void)
             for (int k = 0; k < 4; k++) { f._u32[k] = rnd_float(); n._u32[k] = rnd_int(); }
             CHECKI(cflts, f, imm); CHECKI(cfltu, f, imm); CHECKI(csflt, n, imm); CHECKI(cuflt, n, imm);
         }
-    printf("test_spu_float_est: %ld mismatches\n", s_bad);
+    printf("test_spu_float_est: %s MXCSR: %ld mismatches so far\n", mode ? "SPU (RZ, DAZ, FTZ)" : "default", s_bad);
+    }
+    _mm_setcsr(_mm_getcsr() & ~(0x6000u | 0x8040u));
 
     /* speed: the frest/fi reciprocal pair, vector vs scalar */
     u128 x, y; for (int k = 0; k < 4; k++) { x._u32[k] = 0x3F800000u + rnd32() % 0x800000u; y = x; }
