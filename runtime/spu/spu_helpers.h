@@ -464,21 +464,22 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) { return spu_selb_ref(a, b, 
 #if defined(__SSE4_1__)
 #include <smmintrin.h>
 /* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
- * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
- * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
+ * as the byte loop). SPU byte P lives at host byte P^3 (the bytes of each
+ * 32-bit word reversed). The selector for SPU result byte P is SPU byte P of c,
+ * which sits at host byte P^3, where that result byte goes: so c needs no swap.
+ * It names SPU byte k of {a,b}, at host byte k^3 of a or b: so the pshufb index
+ * is c ^ 3 (pshufb reads bits 0-3, and gives 0 for bit 7, overwritten below),
+ * bit 4 picks b (shifted to bit 7 for blendv), and the special selectors
+ * (bit 7 set: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80) come from a table on the
+ * high nibble, blended in on bit 7 of c itself. 9 ops, no byte swaps. */
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
-    const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
     __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
-    A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);
-    const __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0F));
-    const __m128i fromb = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
-    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), fromb);
-    /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
-    const __m128i m80 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0x80)), _mm_set1_epi8((char)0x80));
-    const __m128i mC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xC0)), _mm_set1_epi8((char)0xC0));
-    const __m128i mE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xE0)), _mm_set1_epi8((char)0xE0));
-    const __m128i special = _mm_blendv_epi8(mC0, _mm_set1_epi8((char)0x80), mE0);
-    r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
+    const __m128i idx = _mm_xor_si128(C, _mm_set1_epi8(3));
+    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), _mm_slli_epi16(C, 3));
+    const __m128i special_lut = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                              (char)0xFF, (char)0xFF, (char)0x80, (char)0x80);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(C, 4), _mm_set1_epi8(0x0F));
+    r = _mm_blendv_epi8(r, _mm_shuffle_epi8(special_lut, hi), C);
     u128 out; memcpy(&out, &r, 16); return out;
 }
 #elif defined(__ARM_NEON)
@@ -797,9 +798,11 @@ SPU__SF_V3(spu__fnms_s, spu__fma_any(x, y, z, 0x80000000u, 0))
  *  - a result not below FLT_MAX in magnitude (an extended-range operand, Inf/NaN on the host; an
  *    overflow, FLT_MAX under round toward zero; or a true FLT_MAX) is redone by the exact per-lane
  *    path, as is every lane the exact forms would also send there;
- *  - a result with biased exponent 0 is +0;
+ *  - a result with biased exponent 0 is +0 (FTZ gives a zero, spu__xr_pz makes it +0);
  *  - fm/fma: a zero factor (biased exponent 0) gives a zero product whatever the other factor
- *    holds, so fm is +0 and fma is the addend (+0 for a zero addend), exactly.
+ *    holds, so fm is +0 and fma is the addend (+0 for a zero addend), exactly. DAZ reads the
+ *    factor as a zero, which gives just that against a finite other factor; against biased
+ *    exponent 255 (Inf/NaN on the host) the product is a NaN and the lane takes the exact path.
  * fma is one fused op with FMA3. Without it, the product of two 24-bit significands is exact in
  * double, the add truncates once at 53 bits and the narrowing truncates again at 24; truncation
  * onto nested grids equals one truncation, and a value below 2^-126 stays below it and flushes.
@@ -829,9 +832,14 @@ SPU__XR_INLINE void spu_float_mode_note(int rz) { (void)rz; }
 #endif
 SPU__XR_INLINE __m128i spu__xr_ld(u128 a) { return _mm_loadu_si128((const __m128i*)a._u32); }
 SPU__XR_INLINE u128 spu__xr_st(__m128i v) { u128 r; _mm_storeu_si128((__m128i*)r._u32, v); return r; }
-SPU__XR_INLINE __m128i spu__xr_z(__m128i x) {          /* biased exponent 0: an SPU zero */
-    return _mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128()); }
-SPU__XR_INLINE __m128i spu__xr_flush(__m128i r) { return _mm_andnot_si128(spu__xr_z(r), r); }
+/* +0 for a zero of either sign; any other value unchanged. In SPU_MXCSR_RZFZ the host reads an
+ * operand with biased exponent 0 as a zero (DAZ) and returns a zero for a result below 2^-126
+ * (FTZ; truncation cannot round a value up to 2^-126), so this is all that is left of the SPU
+ * zero rules: a zero factor gives a zero product, a zero addend adds nothing, and a result with
+ * biased exponent 0 is +0. A zero factor times an operand with biased exponent 255 gives a NaN
+ * here, which fails spu__xr_inrange and takes the exact lane path. */
+SPU__XR_INLINE __m128i spu__xr_pz(__m128 s) {
+    return _mm_castps_si128(_mm_and_ps(s, _mm_cmpneq_ps(s, _mm_setzero_ps()))); }
 SPU__XR_INLINE __m128i spu__xr_inrange(__m128 s) {
     return _mm_castps_si128(_mm_cmplt_ps(_mm_andnot_ps(_mm_set1_ps(-0.0f), s), _mm_set1_ps(0x1.fffffep127f))); }
 SPU__XR_INLINE int spu__xr_all4(__m128i m) { return _mm_movemask_ps(_mm_castsi128_ps(m)) == 0xF; }
@@ -853,15 +861,13 @@ SPU__XR_SLOW u128 spu__xr_fma_fix(u128 r, __m128i ok, u128 a, u128 b, u128 c, ui
 SPU__XR_INLINE u128 spu__xr_fa(u128 a, u128 b, uint32_t negb) {
     const __m128i x = spu__xr_ld(a), y = _mm_xor_si128(spu__xr_ld(b), _mm_set1_epi32((int)negb));
     const __m128 s = _mm_add_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(y));
-    const __m128i ok = spu__xr_inrange(s), r = spu__xr_flush(_mm_castps_si128(s));
+    const __m128i ok = spu__xr_inrange(s), r = spu__xr_pz(s);
     return spu__xr_all4(ok) ? spu__xr_st(r) : spu__xr_fa_fix(spu__xr_st(r), ok, a, b, negb);
 }
 SPU__XR_INLINE u128 spu__xr_fm(u128 a, u128 b) {
     const __m128i x = spu__xr_ld(a), y = spu__xr_ld(b);
-    const __m128i zp = _mm_or_si128(spu__xr_z(x), spu__xr_z(y));                   /* zero product */
     const __m128 s = _mm_mul_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(y));
-    const __m128i ok = _mm_or_si128(spu__xr_inrange(s), zp);
-    const __m128i r = _mm_andnot_si128(zp, spu__xr_flush(_mm_castps_si128(s)));
+    const __m128i ok = spu__xr_inrange(s), r = spu__xr_pz(s);
     return spu__xr_all4(ok) ? spu__xr_st(r) : spu__xr_fm_fix(spu__xr_st(r), ok, a, b);
 }
 SPU__XR_INLINE __m128 spu__xr_madd(__m128 x, __m128 y, __m128 z) {   /* x*y + z, one truncation */
@@ -877,13 +883,10 @@ SPU__XR_INLINE __m128 spu__xr_madd(__m128 x, __m128 y, __m128 z) {   /* x*y + z,
 #endif
 }
 SPU__XR_INLINE u128 spu__xr_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
-    const __m128i xa = spu__xr_ld(a), y = spu__xr_ld(b), zc = spu__xr_ld(c);
-    const __m128i zp = _mm_or_si128(spu__xr_z(xa), spu__xr_z(y));                  /* zero product */
-    const __m128i zi = _mm_andnot_si128(spu__xr_z(zc), _mm_xor_si128(zc, _mm_set1_epi32((int)negc)));  /* zero: +0 */
-    const __m128i x = _mm_xor_si128(xa, _mm_set1_epi32((int)negp));
-    const __m128 s = spu__xr_madd(_mm_castsi128_ps(x), _mm_castsi128_ps(y), _mm_castsi128_ps(zi));
-    const __m128i ok = _mm_or_si128(spu__xr_inrange(s), zp);
-    const __m128i r = _mm_blendv_epi8(spu__xr_flush(_mm_castps_si128(s)), zi, zp);
+    const __m128i x = _mm_xor_si128(spu__xr_ld(a), _mm_set1_epi32((int)negp)), y = spu__xr_ld(b);
+    const __m128i z = _mm_xor_si128(spu__xr_ld(c), _mm_set1_epi32((int)negc));
+    const __m128 s = spu__xr_madd(_mm_castsi128_ps(x), _mm_castsi128_ps(y), _mm_castsi128_ps(z));
+    const __m128i ok = spu__xr_inrange(s), r = spu__xr_pz(s);
     return spu__xr_all4(ok) ? spu__xr_st(r) : spu__xr_fma_fix(spu__xr_st(r), ok, a, b, c, negp, negc);
 }
 #endif
