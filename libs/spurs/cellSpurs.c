@@ -16,6 +16,7 @@
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
+#include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: one SPU_BUSY span per policy-module run */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
@@ -2001,8 +2002,12 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         ReleaseSRWLockExclusive(&si->lock);
         extern unsigned long long ps3_ms_now(void);
         const unsigned long long run_t0 = ps3_ms_now();
+        const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
                               slot->data, slot->wid, slot->ea, slot->spu_num);
+        /* who = 0x100 | lane, apart from SPU thread ids; b = wid as in the SPU_BUSY spans */
+        if (ft_t0) ps3_ft_span(PS3_FT_SPU_BUSY, 0x100u | (uint32_t)slot->spu_num,
+                               (uint32_t)slot->image_id, slot->wid, ft_t0, ps3_ft_now());
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
         if (spurs_dispatch_mask() & (1u << (slot->wid & 31)))
