@@ -63,6 +63,14 @@ enum ps3_ft_kind {
                               * spu_taskset_signal_task (PPU side), 0x20000 for an SPU commit to
                               * a parked taskset's signalled line. (A task's parked time is an
                               * SPU_WAIT span with channel 0x10000 | task id.) */
+    PS3_FT_SPURS_PASS  = 17, /* one SPURS kernel pass, from its wake to its end; who = 0x1FF,
+                              * a = 1 kick pass / 0 full pass | 2 if the wait timed out,
+                              * b = number of policy modules it dispatched */
+    PS3_FT_SPURS_DISP  = 18, /* instant: the kernel gave a lane a workload; who = 0x100 | lane,
+                              * a = wid | 0x100 kicked (ready, signal or flag) | 0x200 kick pass,
+                              * b = readyCount << 16 | signal bits, as found */
+    PS3_FT_SPURS_KICK  = 19, /* instant: a committed write to a SPURS request line; who = 0x1FE,
+                              * a = line EA */
 };
 
 /* selectany (a COMDAT "any": one definition kept, every object sees the same

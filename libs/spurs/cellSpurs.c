@@ -505,6 +505,7 @@ static void spurs_line_committed(uint32_t line)
         if (!ea || (ea & ~127u) != line || !__atomic_load_n(&si->kernel_live, __ATOMIC_ACQUIRE))
             continue;
         __atomic_store_n(&si->kick, 1, __ATOMIC_RELEASE);
+        if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now(); ps3_ft_span(PS3_FT_SPURS_KICK, 0x1FEu, line, 0, t, t); }
         WakeAllConditionVariable(&si->wake);
     }
 }
@@ -2061,14 +2062,16 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
          * line (a probed policy module that writes it cannot feed itself more
          * probes). Every 16th kick pass in a row is a full one, so a steady
          * stream of commits cannot starve the probes either. */
-        int kick_pass = 0;
+        int kick_pass = 0, timed_out = 0;
         if (__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL)) {
             kick_pass = ++kick_run < 16;
         } else {
-            SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0);
+            timed_out = !SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0);
             /* This full pass reads the line after any commit that woke it. */
             (void)__atomic_exchange_n(&si->kick, 0, __ATOMIC_ACQ_REL);
         }
+        const uint64_t ft_pass_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+        u32 ft_ndisp = 0;
         if (!kick_pass) kick_run = 0;
         if (si->stopping) break;
         if (disabled) continue;
@@ -2107,6 +2110,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 ready = vm_read8(ea + wkl_ready_off(wid));
                 signal = vm_read16(ea + wkl_signal_off(wid));
                 spurs_dispatch_log(wid, sn, ready, signal, kicked, kick_pass);
+                if (ft_pass_t0) { const uint64_t t = ps3_ft_now(); ft_ndisp++;
+                    ps3_ft_span(PS3_FT_SPURS_DISP, 0x100u | sn, wid | (kicked ? 0x100u : 0) | (kick_pass ? 0x200u : 0),
+                                ready << 16 | signal, t, t); }
                 if (ready) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
                 if (signal & wkl_signal_bit(wid))
                     ef_w16(ea + wkl_signal_off(wid), (u16)(signal & ~wkl_signal_bit(wid)));
@@ -2128,6 +2134,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             }
         }
         ReleaseSRWLockExclusive(&s_workload_registry_lock);
+        if (ft_pass_t0) ps3_ft_span(PS3_FT_SPURS_PASS, 0x1FFu, (u32)!kick_pass | (timed_out ? 2u : 0), ft_ndisp,
+                                    ft_pass_t0, ps3_ft_now());
     }
     ReleaseSRWLockExclusive(&si->lock);
     return 0;
