@@ -2026,6 +2026,172 @@ static u32 eng_cube_mask(void)
     return mask;
 }
 
+/* What every draw derives from its fragment program, remembered per program
+ * address with the bytes it was derived from. A draw re-walked the ucode six
+ * times over (size, structural hash, constants, three texture-unit scans),
+ * the hash one multiply per byte; a resident program is now checked with a
+ * compare of its instruction words and the rest is read back.
+ *
+ * The inline constant slots are not compared: games patch them in place
+ * between draws, and none of these results depend on them -- every walk
+ * reads only instruction words, and which 16-byte blocks are instructions
+ * follows from the instruction words alone. Except where the texture-unit
+ * walks (a CONST source on a branch is no constant slot to them) and the
+ * constant walk disagree on a block: such a program is compared whole.
+ * The constants themselves are read again at every draw, at the offsets
+ * remembered. A miss computes everything with the decompiler's own
+ * functions, so a hit returns exactly what they would.
+ * PS3RECOMP_ENG_FP_MEMO=0: off (every draw walks the ucode, as before). */
+#define ENG_FP_MEMO_SETS   1024u          /* sets of ENG_FP_MEMO_WAYS, by address */
+#define ENG_FP_MEMO_WAYS   4u
+#define ENG_FP_MEMO_BYTES  4096u          /* larger programs are not remembered */
+typedef struct {
+    u32 size;               /* rsx_fp_program_size */
+    int nconst;             /* rsx_fp_collect_constants' result */
+    u64 shash;              /* rsx_fp_structural_hash, FNV offset basis seed */
+    u32 tex_units;          /* rsx_fp_texture_units */
+    u32 gamma_cand;         /* rsx_fp_texture_gamma_units with every mask set */
+    u32 expand_cand;        /* rsx_fp_texture_expand_units with every mask set */
+} eng_fp_info;
+typedef struct {
+    const u8* uc;
+    int full_compare;
+    eng_fp_info info;
+    u64 const_bits[ENG_FP_MEMO_BYTES / 16u / 64u];   /* blocks that are constant slots */
+    u16 const_off[ENG_FP_MEMO_BYTES / 32u];
+    u8 copy[ENG_FP_MEMO_BYTES];
+} eng_fp_memo;
+static eng_fp_memo* s_fp_memo;            /* SETS x WAYS entries, allocated at first use */
+static u8 s_fp_memo_next[ENG_FP_MEMO_SETS]; /* each set's next way to replace */
+static const eng_fp_memo* s_fp_cur;       /* the entry eng_guest_programs last returned */
+static struct { u64 hit, hit_full, miss, miss_rewrite, uncached; } s_fp_stats;
+
+static int eng_fp_memo_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_FP_MEMO");
+        on = !(e && *e && atoi(e) == 0);
+    }
+    return on;
+}
+
+static void eng_fp_analyze(const u8* uc, u32 size, eng_fp_info* info)
+{
+    static rsx_fp_constant_block scratch;
+    static const u8 all[RSX_DSP_NUM_TEXTURES] = {
+        1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1 };
+    info->size = size;
+    info->shash = rsx_fp_structural_hash(uc, size, 1469598103934665603ull);
+    info->nconst = rsx_fp_collect_constants(uc, size, &scratch);
+    info->tex_units = rsx_fp_texture_units(uc, size);
+    info->gamma_cand = rsx_fp_texture_gamma_units(uc, size, all);
+    info->expand_cand = rsx_fp_texture_expand_units(uc, size, all);
+}
+
+/* The constant walk over the remembered copy: which blocks are constant
+ * slots, and whether the texture-unit walks would agree. */
+static void eng_fp_memo_layout(eng_fp_memo* m)
+{
+    memset(m->const_bits, 0, sizeof m->const_bits);
+    m->full_compare = 0;
+    u32 n = 0;
+    for (u32 off = 0; off + 16 <= m->info.size;) {
+        const u32 w0 = rsx_fp_read_word(m->copy + off);
+        const u32 w1 = rsx_fp_read_word(m->copy + off + 4);
+        const u32 w2 = rsx_fp_read_word(m->copy + off + 8);
+        const u32 w3 = rsx_fp_read_word(m->copy + off + 12);
+        const int cst = (w1 & 3u) == 2 || (w2 & 3u) == 2 || (w3 & 3u) == 2;
+        if (cst && (w2 & (1u << 31))) m->full_compare = 1;
+        off += 16;
+        if (cst && off + 16 <= m->info.size) {
+            m->const_bits[(off / 16u) / 64u] |= 1ull << ((off / 16u) % 64u);
+            if (n < ENG_FP_MEMO_BYTES / 32u) m->const_off[n++] = (u16)off;
+            off += 16;
+        }
+        if (w0 & 1u) break;
+    }
+    if (m->info.nconst < 0 || (u32)m->info.nconst != n) m->full_compare = 1;
+}
+
+static int eng_fp_memo_same(const eng_fp_memo* m, const u8* uc)
+{
+    if (m->full_compare) return !memcmp(m->copy, uc, m->info.size);
+    for (u32 b = 0; b < m->info.size / 16u; b++) {
+        if ((m->const_bits[b / 64u] >> (b % 64u)) & 1u) continue;
+        u64 a0, a1, c0, c1;
+        memcpy(&a0, m->copy + b * 16u, 8); memcpy(&a1, m->copy + b * 16u + 8, 8);
+        memcpy(&c0, uc + b * 16u, 8);      memcpy(&c1, uc + b * 16u + 8, 8);
+        if ((a0 ^ c0) | (a1 ^ c1)) return 0;
+    }
+    return 1;
+}
+
+/* The entry remembering the program at uc, or the one to replace with it. */
+static eng_fp_memo* eng_fp_memo_find(const u8* uc)
+{
+    const u64 a = (u64)(uintptr_t)uc;
+    const u32 set = (u32)((a >> 4) ^ (a >> 14)) & (ENG_FP_MEMO_SETS - 1u);
+    eng_fp_memo* w = &s_fp_memo[set * ENG_FP_MEMO_WAYS];
+    for (u32 i = 0; i < ENG_FP_MEMO_WAYS; i++)
+        if (w[i].uc == uc) return &w[i];
+    return &w[s_fp_memo_next[set]++ % ENG_FP_MEMO_WAYS];
+}
+
+/* rsx_fp_sanitize_constant_word(rsx_fp_read_word(p)), inline */
+static inline u32 eng_fp_constant_word(const u8* p)
+{
+    const u32 be = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+    const u32 w = (be << 16) | (be >> 16);
+    if ((w & 0x7F800000u) != 0x7F800000u) {
+        float f;
+        memcpy(&f, &w, sizeof f);
+        if (f <= 3.0e38f && f >= -3.0e38f) return w;
+    }
+    g_rsx_fp_nonfinite_constants++;
+    return 0;
+}
+
+/* The analysis of the program at fp_uc, fp_size: the remembered one when
+ * eng_guest_programs found it, else computed now. */
+static const eng_fp_info* eng_fp_info_for(const u8* fp_uc, u32 fp_size)
+{
+    if (s_fp_cur && s_fp_cur->uc == fp_uc && s_fp_cur->info.size == fp_size)
+        return &s_fp_cur->info;
+    static eng_fp_info s;
+    eng_fp_analyze(fp_uc, fp_size, &s);
+    return &s;
+}
+
+/* rsx_fp_collect_constants(fp_uc, fp_size, out), from the remembered slot
+ * offsets when the program is the remembered one. */
+static int eng_fp_constants(const u8* fp_uc, u32 fp_size, rsx_fp_constant_block* out)
+{
+    const eng_fp_memo* m = s_fp_cur;
+    if (!m || m->uc != fp_uc || m->info.size != fp_size || m->full_compare)
+        return rsx_fp_collect_constants(fp_uc, fp_size, out);
+    const u32 n = (u32)m->info.nconst;
+    for (u32 i = 0; i < n; i++)
+        for (u32 c = 0; c < 4; c++)
+            out->values[i][c] = eng_fp_constant_word(fp_uc + m->const_off[i] + c * 4u);
+    out->count = n;
+    return (int)n;
+}
+
+static void eng_fp_memo_stats(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PS3RECOMP_ENG_FP_MEMO_STATS") ? 1 : 0;
+    if (!on) return;
+    const u64 total = s_fp_stats.hit + s_fp_stats.miss + s_fp_stats.uncached;
+    if (total & 0x3FFFFu) return;
+    fprintf(stderr, "[rsx engine] fp memo: %llu hits (%llu whole-program), %llu misses"
+                    " (%llu at the same address), %llu uncached\n",
+            (unsigned long long)s_fp_stats.hit, (unsigned long long)s_fp_stats.hit_full,
+            (unsigned long long)s_fp_stats.miss, (unsigned long long)s_fp_stats.miss_rewrite,
+            (unsigned long long)s_fp_stats.uncached);
+}
+
 /* Are both of the guest's own programs resident? One answer, used by the
  * layout and by the pipeline, because they must not disagree: the built-in
  * program declares all sixteen inputs, so narrowing the layout for it would
@@ -2053,10 +2219,47 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
         fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
         /* in tiled main memory: as far as the size scan may look, detiled */
         const int fp_tiled = fp_uc && eng_tiled(fp_loc, fp_off, ENG_FP_MAX_BYTES);
+        eng_fp_memo* m = NULL;
+        if (fp_uc && !fp_tiled && eng_fp_memo_on()) {
+            if (!s_fp_memo)
+                s_fp_memo = (eng_fp_memo*)calloc(ENG_FP_MEMO_SETS * ENG_FP_MEMO_WAYS,
+                                                 sizeof *s_fp_memo);
+            if (s_fp_memo) {
+                m = eng_fp_memo_find(fp_uc);
+                if (m->uc == fp_uc && m->info.size &&
+                    eng_guest_ptr(NULL, fp_loc, fp_off, m->info.size) == fp_uc &&
+                    eng_fp_memo_same(m, fp_uc)) {
+                    s_fp_stats.hit++;
+                    s_fp_stats.hit_full += (u64)m->full_compare;
+                    s_fp_cur = m;
+                    fp_size = m->info.size;
+                    goto fp_done;
+                }
+            }
+        }
+        s_fp_cur = NULL;
         if (fp_tiled) fp_uc = eng_fetch_detiled(fp_loc, fp_off, ENG_FP_MAX_BYTES);
         fp_size = fp_uc ? rsx_fp_program_size(fp_uc, ENG_FP_MAX_BYTES) : 0;
         if (fp_size && !fp_tiled) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
         if (!fp_uc) fp_size = 0;
+        if (m && fp_size && fp_size <= ENG_FP_MEMO_BYTES) {
+            s_fp_stats.miss_rewrite += (u64)(m->uc == fp_uc);
+            /* analysed from the copy, so the copy and what is read back from
+             * it agree even if the guest is rewriting the program meanwhile */
+            memcpy(m->copy, fp_uc, fp_size);
+            m->uc = NULL;
+            if (rsx_fp_program_size(m->copy, fp_size) == fp_size) {
+                m->uc = fp_uc;
+                eng_fp_analyze(m->copy, fp_size, &m->info);
+                eng_fp_memo_layout(m);
+                s_fp_cur = m;
+            }
+            s_fp_stats.miss++;
+        } else if (fp_size) {
+            s_fp_stats.uncached++;
+        }
+    fp_done:
+        eng_fp_memo_stats();
     }
 
     if (out_vp) *out_vp = vp_uc;
@@ -2242,8 +2445,7 @@ static u32 eng_user_clip_key(void)
  * found in one run is named the same in the next. 0 for the built-in one. */
 static u64 eng_fp_debug_hash(const u8* fp_uc, u32 fp_size)
 {
-    return fp_uc && fp_size
-        ? rsx_fp_structural_hash(fp_uc, fp_size, 1469598103934665603ull) : 0;
+    return fp_uc && fp_size ? eng_fp_info_for(fp_uc, fp_size)->shash : 0;
 }
 
 /* The depth-bounds test (SET_DEPTH_BOUNDS_TEST_ENABLE 0x0380, MIN 0x0384,
@@ -2290,7 +2492,7 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
     if (!eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size)) return;
     /* A unit the program neither samples nor has declared as a cube or a
      * volume (rsx_fp_apply_depth_bounds reads it as a Texture2D). */
-    const u32 busy = rsx_fp_texture_units(fp_uc, fp_size) | eng_cube_mask() | eng_volume_mask();
+    const u32 busy = eng_fp_info_for(fp_uc, fp_size)->tex_units | eng_cube_mask() | eng_volume_mask();
     int unit = -1;
     for (int u = RSX_BE_MAX_TEXTURES - 1; u >= 0 && unit < 0; u--)
         if (!((busy >> u) & 1u)) unit = u;
@@ -2344,7 +2546,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
 
     rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
     u32 shadow_mask = 0;
-    const u32 sampled_units = fixed ? 0 : rsx_fp_texture_units(fp_uc, fp_size);
+    const eng_fp_info* fpi = fixed ? NULL : eng_fp_info_for(fp_uc, fp_size);
+    const u32 sampled_units = fixed ? 0 : fpi->tex_units;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         if (!(sampled_units & (1u << u))) continue;
         rsx_dsp_texture t;
@@ -2353,23 +2556,29 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             t.cubemap, t.mipmaps, t.filter, t.wrap, t.control0);
         if (shadow[u].enabled) shadow_mask |= 1u << u;
     }
+    /* Only the units the program could apply gamma on are looked at: the
+     * others' masks are cleared below in any case. */
     u8 gamma_masks[RSX_DSP_NUM_TEXTURES] = {0};
+    u32 gamma_units = 0;
     if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
+        if (!(fpi->gamma_cand & (1u << u))) continue;
         rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
         if (t.enabled) gamma_masks[u] = rsx_texture_gamma_mask(t.format, t.remap, t.filter, t.wrap);
+        if (gamma_masks[u]) gamma_units |= 1u << u;
     }
-    const u32 gamma_units = fixed ? 0 : rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
         if (!(gamma_units & (1u << u))) gamma_masks[u] = 0;
     /* Texture sign expansion: SET_TEXTURE_ADDRESS's UNSIGNED_REMAP_BIASED
      * asks that every fetch come back re-centred to -1..1. Same rule as
      * gamma: only units the program samples count. */
     u8 expand_masks[RSX_DSP_NUM_TEXTURES] = {0};
+    u32 expand_units = 0;
     if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
+        if (!(fpi->expand_cand & (1u << u))) continue;
         rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
         if (t.enabled) expand_masks[u] = rsx_texture_expand_mask(t.format, t.remap, t.filter, t.wrap);
+        if (expand_masks[u]) expand_units |= 1u << u;
     }
-    const u32 expand_units = fixed ? 0 : rsx_fp_texture_expand_units(fp_uc, fp_size, expand_masks);
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
         if (!(expand_units & (1u << u))) expand_masks[u] = 0;
 
@@ -2383,7 +2592,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             unnorm_dim[u][0] = unnorm_dim[u][1] = unnorm_dim[u][2] = 0;
 
     g.fp_constants.count = 0;
-    if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
+    if (!fixed && eng_fp_constants(fp_uc, fp_size, &g.fp_constants) < 0)
         return 0;
 
     /* An antialiased target is held at its sample grid; WPOS must still count
@@ -2405,8 +2614,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     } else {
         key = eng_vp_hash(vp_uc, vp_instrs * 16u, key);
         if (vp_branch_bits_used) key = eng_fnv1a(&vp_branch_bits, sizeof vp_branch_bits, key);
-        key = rsx_fp_structural_hash(fp_uc, fp_size, key);
-        if (!key) return 0;
+        /* the structural hash seeded with the FNV basis, folded in */
+        if (!fpi->shash) return 0;
+        key = eng_fnv1a(&fpi->shash, sizeof fpi->shash, key);
         const u32 fp_ctrl_key = fp_ctrl & 0x4Eu; /* colour width and fragment depth export */
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         if (srgb_output) key = eng_fnv1a(&srgb_output, sizeof srgb_output, key);
