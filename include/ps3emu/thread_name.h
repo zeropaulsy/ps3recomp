@@ -41,11 +41,16 @@ static inline void ps3_thread_name(const char* fmt, ...)
 }
 #elif defined(__linux__)
 #include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 /* The kernel keeps 15 characters (PR_SET_NAME truncates), shown by ps -L,
- * top -H, perf and /proc/<pid>/task/<tid>/comm. */
+ * top -H, perf and /proc/<pid>/task/<tid>/comm. The process's first thread
+ * keeps its name: that name is the process name (/proc/<pid>/comm), which
+ * pgrep -x, pidof and launcher watchdogs use to find the game. */
 static inline void ps3_thread_name(const char* fmt, ...)
 {
+    if ((pid_t)syscall(SYS_gettid) == getpid()) return;
     char s[64];
     va_list ap;
     va_start(ap, fmt);
