@@ -514,10 +514,17 @@ static int vk_defer_views(void)
     if (on < 0) { const char* e = getenv("VK_DEFER_VIEW_DESTROY"); on = !(e && *e == '0'); }
     return on;
 }
+/* Framebuffers dropped from the engine's cache while a batch may still use
+ * them (vk_eng_rt_pool_put), on the same per-slot terms. */
+#define VK_FB_GRAVE_MAX 64u
+static VkFramebuffer s_vk_fbgrave[2][VK_FB_GRAVE_MAX];
+static u32 s_vk_fbgrave_n[2];
 static void vk_grave_empty_slot(u32 k)
 {
     for (u32 i = 0; i < s_vk_grave_n[k]; i++) pvkDestroyImageView(s_vk.device, s_vk_grave[k][i], NULL);
     s_vk_grave_n[k] = 0;
+    for (u32 i = 0; i < s_vk_fbgrave_n[k]; i++) pvkDestroyFramebuffer(s_vk.device, s_vk_fbgrave[k][i], NULL);
+    s_vk_fbgrave_n[k] = 0;
 }
 static void vk_grave_empty(void)   /* every submission so far has completed */
 {
@@ -2539,9 +2546,12 @@ static void vk_eng_texture_release(void* user, u32 handle)
 {
     if (vk_eng_release_kind_ok(handle, 0, 0)) vk_eng_release(user, handle);
 }
+static int vk_eng_rt_pool_put(u32 handle);
 static void vk_eng_color_target_release(void* user, u32 handle)
 {
-    if (vk_eng_release_kind_ok(handle, 1, 0)) vk_eng_release(user, handle);
+    if (!vk_eng_release_kind_ok(handle, 1, 0)) return;
+    if (vk_eng_rt_pool_put(handle)) return;
+    vk_eng_release(user, handle);
 }
 static void vk_eng_depth_target_release(void* user, u32 handle)
 {
@@ -2550,16 +2560,49 @@ static void vk_eng_depth_target_release(void* user, u32 handle)
 
 static void vk_eng_snapshot_pool_drain(void);
 static void vk_dac_shutdown(void);
+static void vk_eng_rt_pool_drain(void);
 
 static void vk_eng_shutdown(void* user)
 {
     vk_eng2_shutdown(user);
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
     vk_eng_snapshot_pool_drain();
+    vk_eng_rt_pool_drain();
     vk_dac_shutdown();
     vk_eb_release();
     vk_destroy_buffer(&s_rb_stage);
     vk_destroy_buffer(&s_up_stage);
+}
+
+/* Released colour targets kept for a target of the same format and size
+ * (VK_RT_POOL, default on with draw batching, =0 off). LittleBigPlanet 2
+ * renders a 768x768 pass into display buffer 0's memory between frames at
+ * 1280x720 there, and the engine keeps one target per address, so each frame
+ * destroyed one image and created another: a full flush and wait for the
+ * framebuffers, then a wait for the new target's clear. A pooled image needs
+ * no wait: it is reused on the same queue, behind a barrier. */
+#define VK_RT_POOL_MAX 4u
+static struct { vk_image im; VkFormat fmt; u32 w, h; } s_rt_pool[VK_RT_POOL_MAX];
+static u32 s_rt_pool_n;
+static int vk_rt_pool_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("VK_RT_POOL"); on = !(e && *e == '0'); }
+    return on;
+}
+static int vk_eng_rt_pool_take(vk_image* im, VkFormat fmt, u32 w, u32 h)
+{
+    for (u32 i = 0; i < s_rt_pool_n; i++)
+        if (s_rt_pool[i].fmt == fmt && s_rt_pool[i].w == w && s_rt_pool[i].h == h) {
+            *im = s_rt_pool[i].im;
+            s_rt_pool[i] = s_rt_pool[--s_rt_pool_n];
+            return 1;
+        }
+    return 0;
+}
+static void vk_eng_rt_pool_drain(void)
+{
+    while (s_rt_pool_n) vk_destroy_image(&s_rt_pool[--s_rt_pool_n].im);
 }
 
 static void vk_eng_submit_and_wait(void* user, u32 reason)
@@ -2582,21 +2625,26 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
     vk_eng_obj* o = &s_eobj[hd];
-    if (vk_create_image(&o->im, vf, w, h,
+    if (!vk_eng_rt_pool_take(&o->im, vf, w, h) &&
+        vk_create_image(&o->im, vf, w, h,
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                         VK_IMAGE_ASPECT_COLOR_BIT)) {
         vk_destroy_image(&o->im); return 0;
     }
     o->kind = VK_ENG_COLOR; o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h;
-    /* UNDEFINED -> GENERAL, then the guest's own bytes when the engine could
-     * resolve them, else transparent black so the contents are defined. */
-    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
+    /* UNDEFINED -> GENERAL (a pooled image's old contents discarded, after
+     * whatever still used it), then the guest's own bytes when the engine
+     * could resolve them, else transparent black so the contents are defined.
+     * With batching the clear joins the open batch. */
+    const int batched = vk_eb_active();
+    if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) { vk_eng_release(user, hd); return 0; }
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearColorValue zero = { .float32 = { 0.0f, 0.0f, 0.0f, 0.0f } };
     VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     pvkCmdClearColorImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &r);
-    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
+    if (batched) vk_eb_recorded();
+    else if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
     if (seed && seed_row_bytes)
         vk_eng_upload(o->im.img, 0, 0, w, h, bpp, seed, seed_row_bytes);
     return hd;
@@ -3390,6 +3438,47 @@ static void vk_eng_drop_framebuffers(void)
     for (u32 i = 0; i < s_e2.fb_count; i++)
         if (s_e2.fb[i].fb) pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
     s_e2.fb_count = 0;
+}
+
+/* A framebuffer a batch may still use goes once that batch has completed. */
+static void vk_destroy_framebuffer_later(VkFramebuffer fb)
+{
+    if (!fb) return;
+    if (vk_eb_busy() && s_vk_fbgrave_n[s_vk_gslot] >= VK_FB_GRAVE_MAX) vk_eng_flush();
+    if (vk_eb_busy()) { s_vk_fbgrave[s_vk_gslot][s_vk_fbgrave_n[s_vk_gslot]++] = fb; return; }
+    pvkDestroyFramebuffer(s_vk.device, fb, NULL);
+}
+
+/* A released colour target into s_rt_pool instead of destroyed (0: not
+ * pooled, release it the usual way). Its crossbar views go as in
+ * vk_eng_release; cached framebuffers naming its handle leave the cache,
+ * since the handle will name another object, but are destroyed only once no
+ * batch can use them; the image itself stays alive in the pool. */
+static int vk_eng_rt_pool_put(u32 handle)
+{
+    vk_eng_obj* o = vk_eng_get(handle, VK_ENG_COLOR);
+    if (!o || o->snapshot || !o->im.img || !vk_eb_active() || !vk_rt_pool_on() ||
+        s_rt_pool_n >= VK_RT_POOL_MAX)
+        return 0;
+    for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
+        if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == handle) {
+            vk_destroy_image(&s_eobj[i].im);
+            memset(&s_eobj[i], 0, sizeof s_eobj[i]);
+        }
+    for (u32 i = 0; i < s_e2.fb_count; ) {
+        int hit = 0;
+        for (u32 k = 0; k < RSX_BE_MAX_COLOR_TARGETS; k++) hit |= s_e2.fb[i].key[k] == handle;
+        if (!hit) { i++; continue; }
+        vk_destroy_framebuffer_later(s_e2.fb[i].fb);
+        s_e2.fb[i] = s_e2.fb[--s_e2.fb_count];
+    }
+    s_rt_pool[s_rt_pool_n].im = o->im;
+    s_rt_pool[s_rt_pool_n].fmt = o->fmt;
+    s_rt_pool[s_rt_pool_n].w = o->w;
+    s_rt_pool[s_rt_pool_n].h = o->h;
+    s_rt_pool_n++;
+    memset(o, 0, sizeof *o);
+    return 1;
 }
 
 /* The render pass for `n` colour attachments of format `cf` plus depth,
