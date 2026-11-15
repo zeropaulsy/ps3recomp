@@ -1989,7 +1989,7 @@ static u32 spurs_idle_max(void)
 static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
-    ps3_thread_name("spurs pm");
+    ps3_thread_name("spurs pm %u", (unsigned)slot->spu_num);
     struct SpursInst* si = slot->instance;
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
