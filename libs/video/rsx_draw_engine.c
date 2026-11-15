@@ -1412,6 +1412,33 @@ static void eng_unvtc_3d_slice(u8* dst, const u8* src, u32 blocks, u32 d, u32 z,
                base + ((size_t)i * n + (z & 3)) * block_bytes, block_bytes);
 }
 
+/* FNV-1a style, word at a time, in four interleaved lanes: each multiply
+ * waits only on its own lane, so the loop runs at load speed instead of at
+ * one multiply latency per 8 bytes. A change detector only (each value is
+ * compared with the same texture's earlier one), so the exact function is
+ * free to choose. */
+static u64 eng_fnv4(const u8* src, u32 span)
+{
+    const u64 P = 1099511628211ull;
+    u64 h0 = 1469598103934665603ull, h1 = 0x9E3779B97F4A7C15ull,
+        h2 = 0xC2B2AE3D27D4EB4Full,  h3 = 0x165667B19E3779F9ull;
+    u32 i = 0;
+    for (; i + 32 <= span; i += 32) {
+        u64 w[4];
+        memcpy(w, src + i, sizeof(w));
+        h0 = (h0 ^ w[0]) * P; h1 = (h1 ^ w[1]) * P;
+        h2 = (h2 ^ w[2]) * P; h3 = (h3 ^ w[3]) * P;
+    }
+    u64 hash = ((h0 ^ h1 * 31u) * P ^ h2) * P ^ h3;
+    for (; i + 8 <= span; i += 8) {
+        u64 word;
+        memcpy(&word, src + i, sizeof(word));
+        hash = (hash ^ word) * P;
+    }
+    for (; i < span; i++) hash = (hash ^ src[i]) * P;
+    return hash;
+}
+
 /* One hash per cached texture per presented frame. Word-at-a-time FNV over
  * the whole span is deliberately cheap: this is a mutation detector, not a
  * content id (rsx_live_draw.c:2002-2026). */
@@ -1422,17 +1449,8 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
     if (rsx_tiling_active()) rsx_tiling_footprint(location, offset, span, &offset, &span);
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
-    u64 hash = 1469598103934665603ull;
-    u32 i = 0;
-    for (; i + 8 <= span; i += 8) {
-        u64 word;
-        memcpy(&word, src + i, sizeof(word));
-        hash ^= word;
-        hash *= 1099511628211ull;
-    }
-    for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
     *readable = 1;
-    return hash;
+    return eng_fnv4(src, span);
 }
 
 /* The cheap per-frame change check: 64 bytes out of every 2 KB, plus the
@@ -1449,15 +1467,19 @@ static u64 eng_texture_sparse_hash(u32 location, u32 offset, u32 span,
     if (rsx_tiling_active()) rsx_tiling_footprint(location, offset, span, &offset, &span);
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
-    u64 hash = 1469598103934665603ull;
+    const u64 P = 1099511628211ull;
+    u64 h[4] = { 1469598103934665603ull, 0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full,
+                 0x165667B19E3779F9ull };
     for (u32 i = 0; i + 64 <= span; i += ENG_TEXHASH_STRIDE)
-        for (u32 k = 0; k < 64; k += 8) {
-            u64 word;
-            memcpy(&word, src + i + k, sizeof(word));
-            hash = (hash ^ word) * 1099511628211ull;
-        }
+        for (u32 k = 0; k < 64; k += 32)
+            for (u32 l = 0; l < 4; l++) {
+                u64 word;
+                memcpy(&word, src + i + k + l * 8, sizeof(word));
+                h[l] = (h[l] ^ word) * P;
+            }
+    u64 hash = ((h[0] ^ h[1] * 31u) * P ^ h[2]) * P ^ h[3];
     for (u32 i = span > 64 ? span - 64 : 0; i < span; i++)
-        hash = (hash ^ src[i]) * 1099511628211ull;
+        hash = (hash ^ src[i]) * P;
     *readable = 1;
     return hash;
 }
