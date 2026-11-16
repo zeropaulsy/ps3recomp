@@ -1982,6 +1982,34 @@ static u32 spurs_idle_max(void)
     return (u32)s_max;
 }
 
+/* SPURS_LANE0_CPUS=<cpu list>, e.g. "5,11" or "4-5": the host CPUs worker 0 may
+ * run on. The kernel thread fills lanes from 0 up, so lane 0 carries the
+ * busiest workload; a job chain with maxContention 1 runs there almost
+ * entirely and can be a title's critical path. A port that also keeps its
+ * other threads off those CPUs gives that lane a physical core of its own: in
+ * LBP2, sharing the core with an SMT sibling cost the lane ~7% of its run
+ * time. CPUs 0-63; unset, malformed or empty leaves the thread alone. */
+static void spurs_pin_lane0(void)
+{
+    const char* e = getenv("SPURS_LANE0_CPUS");
+    if (!e || !*e) return;
+    unsigned long long mask = 0;
+    const char* s = e;
+    while (*s) {
+        char* end;
+        unsigned long a = strtoul(s, &end, 10), b = a;
+        if (end == s) return;
+        if (*end == '-') { s = end + 1; b = strtoul(s, &end, 10); if (end == s) return; }
+        if (a > 63 || b > 63 || b < a) return;
+        for (unsigned long c = a; c <= b; c++) mask |= 1ull << c;
+        s = end;
+        if (*s == ',') s++; else if (*s) return;
+    }
+    if (!mask) return;
+    if (SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)mask))
+        printf("[cellSpurs] lane 0 pinned to CPUs %s\n", e);
+}
+
 /* One persistent worker for each configured virtual SPU. A waiting policy
  * occupies only its own slot; a later runnable producer can use another slot.
  * Admission and lifecycle state are serialized per instance. Guest execution
@@ -1990,6 +2018,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
     ps3_thread_name("spurs pm %u", (unsigned)slot->spu_num);
+    if (slot->spu_num == 0) spurs_pin_lane0();
     struct SpursInst* si = slot->instance;
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
