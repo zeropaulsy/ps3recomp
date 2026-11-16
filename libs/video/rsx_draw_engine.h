@@ -300,6 +300,13 @@ typedef struct rsx_draw_backend {
                                      float depth_value, u8 stencil,
                                      u32 x, u32 y, u32 w, u32 h);
 
+    /* Optional. Copy the w x h rectangle at (sx, sy) of colour target `src`
+     * to (dx, dy) of colour target `dst` (same format, different targets),
+     * in command order and without waiting: after every draw already handed
+     * over and before the next. NULL: RSX_ENGINE_XFER_SHADOW stays off. */
+    void (*color_target_copy)(void* user, u32 src, u32 sx, u32 sy,
+                              u32 dst, u32 dx, u32 dy, u32 w, u32 h);
+
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -362,6 +369,21 @@ void rsx_draw_engine_note_flip(u32 buffer_id);
  * out with the same pitch take part; anything else is left alone. */
 void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
 void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
+
+/* RSX_ENGINE_XFER_SHADOW=1 (opt-in): an unscaled 2D transfer from an engine
+ * surface to guest memory, and the transfer bringing those bytes back into a
+ * surface, stay on the GPU (rsx_draw_engine.c explains when that is right).
+ * xfer_out / xfer_back return 1 when they took the transfer, and the caller
+ * then neither copies the bytes nor calls guest_read / guest_wrote. Offsets
+ * are each rectangle's first byte, w and h in 32-bit pixels. xfer_sync gives
+ * guest memory the bytes of any such copy overlapping the rectangle of `rows`
+ * rows of `row_bytes` bytes, `pitch` apart, before something else reads or
+ * writes them there. */
+int  rsx_draw_engine_xfer_out(u32 src_location, u32 src_offset, u32 src_pitch,
+                              u32 dst_location, u32 dst_offset, u32 dst_pitch, u32 w, u32 h);
+int  rsx_draw_engine_xfer_back(u32 src_location, u32 src_offset, u32 src_pitch,
+                               u32 dst_location, u32 dst_offset, u32 dst_pitch, u32 w, u32 h);
+void rsx_draw_engine_xfer_sync(u32 location, u32 offset, u32 pitch, u32 row_bytes, u32 rows);
 
 /* --- test hooks ---------------------------------------------------------- */
 

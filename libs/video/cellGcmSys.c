@@ -1606,6 +1606,9 @@ static void nv3089_blit(void)
         u32 src2 = cellGcmResolveLocated(sl, s_nv3089.in_off);
         u32 dst2 = cellGcmResolveLocated(1, s_nv309e.offset);
         u32 u0b = s_nv3089.in_uv & 0xFFFF, v0b = s_nv3089.in_uv >> 16;
+        if (rsx_draw_engine_enabled())
+            rsx_draw_engine_xfer_sync(sl ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN, s_nv3089.in_off,
+                                      in_pitch, in_pitch, (s_nv3089.in_sz >> 16) ? (s_nv3089.in_sz >> 16) : 1u);
         nv3089_engine_read(in_pitch, out_w, out_h);
         /* A source in tiled main memory is read a row at a time through the
          * tiling, up to the last texel the row samples. */
@@ -1687,6 +1690,30 @@ static void nv3089_blit(void)
     u32 dbpp = (s_gcm2d.color_fmt == 4u /* R5G6B5 */) ? 2u
              : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
     u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
+    /* RSX_ENGINE_XFER_SHADOW: an unscaled, unclipped 32-bit copy out of an
+     * engine surface, or one bringing such a copy back, stays on the GPU
+     * (rsx_draw_engine.c). Every other copy first gives guest memory the
+     * bytes of any such copy it reads or overwrites. */
+    if (bpp == 4 && rsx_draw_engine_enabled()) {
+        const u32 sloc = src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+        const u32 dloc = dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+        const u32 sx0 = (u32)(nv3089_origin(u0) >> 20), sy0 = (u32)(nv3089_origin(v0) >> 20);
+        const u32 s_at = s_nv3089.in_off + sy0 * in_pitch + sx0 * 4u;
+        const u32 d_at = s_gcm2d.dst_offset + out_y * dst_pitch + out_x * 4u;
+        const int plain = s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
+                          cx0 <= out_x && cy0 <= out_y &&
+                          (u64)out_x + out_w <= cx1 && (u64)out_y + out_h <= cy1 &&
+                          !gcm_rect_tiled(src_local, s_nv3089.in_off, in_pitch, s_nv3089.in_sz >> 16) &&
+                          !gcm_rect_tiled(dst_local, s_gcm2d.dst_offset, dst_pitch, out_y + out_h);
+        if (plain && (rsx_draw_engine_xfer_back(sloc, s_at, in_pitch, dloc, d_at, dst_pitch, out_w, out_h) ||
+                      rsx_draw_engine_xfer_out(sloc, s_at, in_pitch, dloc, d_at, dst_pitch, out_w, out_h)))
+            return;
+        /* the source rows the copy samples, the destination rows it writes */
+        const u32 sw = (u32)((nv3089_origin(u0) + (u64)(out_w - 1u) * s_nv3089.ds_dx) >> 20) + 1u - sx0;
+        const u32 sh = (u32)((nv3089_origin(v0) + (u64)(out_h - 1u) * s_nv3089.dt_dy) >> 20) + 1u - sy0;
+        rsx_draw_engine_xfer_sync(sloc, s_at, in_pitch, sw * 4u, sh);
+        rsx_draw_engine_xfer_sync(dloc, d_at, dst_pitch, out_w * 4u, out_h);
+    }
     if (bpp == 4) nv3089_engine_read(in_pitch, out_w, out_h);
     /* NV3089_ROWCOPY (default 1): an unscaled blit copies a row at a time.
      * The per-pixel loop pays a vm_read32 and a vm_write32 per pixel -- the

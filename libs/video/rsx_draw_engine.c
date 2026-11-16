@@ -272,11 +272,14 @@ void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user
     s_guest_user = user;
 }
 
+static u32 s_xs_n;   /* RSX_ENGINE_XFER_SHADOW copies held (see rsx_draw_engine_xfer_out) */
+
 static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
                                u32 min_bytes)
 {
     (void)user;
     if (!min_bytes || min_bytes > (256u << 20)) return NULL;
+    if (s_xs_n) rsx_draw_engine_xfer_sync(location, offset, 0, min_bytes, 1);
     if (s_guest_reader) return s_guest_reader(s_guest_user, location, offset, min_bytes);
     if (!vm_base) return NULL;
     const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
@@ -1114,6 +1117,176 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
                 eng_nonzero_pixels(rows, w * h, 4u));
     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
+}
+
+/* ---- RSX_ENGINE_XFER_SHADOW ---------------------------------------------
+ * LBP2 copies its finished scene to main memory every frame (two NV3089
+ * blits, 1024 + 256 px wide) for the SPU MLAA job and copies it back once the
+ * job is done. Without the job (LBP2_NO_MLAA=1) the bytes come back as they
+ * went out, yet the copy out costs a full GPU flush plus a readback and the
+ * copy back an upload, about 4 ms of the RSX thread's frame. With
+ * RSX_ENGINE_XFER_SHADOW=1 the copy out goes into a GPU image instead, in
+ * command order and with no wait, and a copy back of those bytes into a
+ * surface comes from that image. Guest memory gets the bytes only when the
+ * engine or another transfer reads or overwrites them (xfer_sync). A PPU or
+ * SPU touching them in between is not seen, so this is right only while
+ * nothing else uses the bytes: opt-in. */
+#define ENG_XS_MAX 8u
+typedef struct { u32 loc, off, pitch, w, h, img; } eng_xshadow;
+static eng_xshadow s_xs[ENG_XS_MAX];
+static u32 s_xs_imgs[ENG_XS_MAX];    /* images kept for reuse, by size */
+static u32 s_xs_img_w[ENG_XS_MAX], s_xs_img_h[ENG_XS_MAX];
+static u32 s_xs_nimg;
+static int s_xs_busy;
+
+static int eng_xs_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_ENGINE_XFER_SHADOW"); on = e && *e && *e != '0'; }
+    return on && g.ready && g.be->color_target_copy && g.be->color_target_create && g.be->readback;
+}
+
+/* Does the byte range [off, off + len) touch one of entry e's rows? The two
+ * halves of LBP2's scene copy interleave at one pitch, so the rows matter,
+ * not the span from the first byte to the last. */
+static int eng_xs_overlaps_range(const eng_xshadow* e, u32 loc, u32 off, u32 len)
+{
+    if (e->loc != loc || !len) return 0;
+    const u64 a = off, b = (u64)off + len, base = e->off, rb = (u64)e->w * 4u;
+    if (b <= base) return 0;
+    /* the first row ending after a: base + r * pitch + rb > a */
+    const u64 r = (a + 1u > base + rb) ? (a + 1u - base - rb + e->pitch - 1u) / e->pitch : 0u;
+    return r < e->h && base + r * e->pitch < b;
+}
+
+/* ... or the rectangle of `rows` rows of `row_bytes` bytes, `pitch` apart. */
+static int eng_xs_overlaps(const eng_xshadow* e, u32 loc, u32 off, u32 pitch, u32 row_bytes, u32 rows)
+{
+    if (e->loc != loc) return 0;
+    if (rows <= 1u || pitch <= row_bytes) {
+        const u64 len = rows <= 1u ? row_bytes : (u64)(rows - 1u) * pitch + row_bytes;
+        return eng_xs_overlaps_range(e, loc, off, len > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)len);
+    }
+    for (u32 r = 0; r < rows; r++)
+        if (eng_xs_overlaps_range(e, loc, off + r * pitch, row_bytes)) return 1;
+    return 0;
+}
+
+static int eng_xs_log(void)
+{
+    static int left = -1;
+    if (left < 0) { const char* e = getenv("RSX_ENGINE_XFER_SHADOW_LOG"); left = e ? atoi(e) : 0; }
+    return left > 0 ? left-- : 0;
+}
+
+/* Guest memory gets entry i's bytes; the entry goes. */
+static void eng_xs_store(u32 i, const char* why)
+{
+    const eng_xshadow e = s_xs[i];
+    s_xs[i] = s_xs[--s_xs_n];
+    static unsigned long n_store;
+    if (++n_store <= 8 || eng_xs_log())
+        fprintf(stderr, "[rsx engine] xfer shadow: %u:0x%08X %ux%u stored to guest memory (%s; %lu so far)\n",
+                e.loc, e.off, e.w, e.h, why, n_store);
+    /* Its own buffer: this can run inside a caller's use of the coherence one
+     * (guest_wrote's row reads come through eng_guest_ptr). */
+    static u8* rows; static size_t cap;
+    const size_t bytes = (size_t)e.w * 4u * e.h;
+    if (cap < bytes) { u8* n = (u8*)realloc(rows, bytes); if (!n) return; rows = n; cap = bytes; }
+    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    g.be->readback(g.be->user, e.img, 0, 0, e.w, e.h, rows, e.w * 4u);
+    const int rgba = rsx_texture_argb_is_rgba();
+    s_xs_busy = 1;
+    for (u32 r = 0; r < e.h; r++) {
+        u8* src = rows + (size_t)r * e.w * 4u;
+        if (!rgba) eng_row_convert(src, src, e.w, 0, 1);
+        u8* dst = (u8*)eng_guest_ptr(NULL, e.loc, e.off + r * e.pitch, e.w * 4u);
+        if (dst) memcpy(dst, src, (size_t)e.w * 4u);
+    }
+    s_xs_busy = 0;
+}
+
+void rsx_draw_engine_xfer_sync(u32 location, u32 offset, u32 pitch, u32 row_bytes, u32 rows)
+{
+    if (s_xs_busy || !row_bytes || !rows) return;
+    for (u32 i = 0; i < s_xs_n; )
+        if (eng_xs_overlaps(&s_xs[i], location, offset, pitch, row_bytes, rows))
+            eng_xs_store(i, "read or overwritten");
+        else i++;
+}
+
+int rsx_draw_engine_xfer_out(u32 sloc, u32 soff, u32 spitch,
+                             u32 dloc, u32 doff, u32 dpitch, u32 w, u32 h)
+{
+    if (!w || !h || !dpitch || !eng_xs_on()) return 0;
+    u32 xb = 0, y = 0;
+    const u32 slot = eng_surface_at(sloc, soff, spitch, &xb, &y);
+    if (slot == ENG_INVALID) return 0;
+    const eng_surface* s = &g.surfaces[slot];
+    if (s->fmt != RSX_BE_FMT_R8G8B8A8 || xb % 4u) return 0;
+    const u32 x = xb / 4u;
+    if (x + w > s->w || y + h > s->h) return 0;
+    const u32 len = (h - 1u) * dpitch + w * 4u;
+    if (eng_tiled(dloc, doff, len)) return 0;
+    /* The same destination again takes over that entry; anything else it
+     * overlaps keeps its bytes by storing them first. */
+    u32 img = 0;
+    for (u32 i = 0; i < s_xs_n; ) {
+        eng_xshadow* e = &s_xs[i];
+        if (e->loc == dloc && e->off == doff && e->pitch == dpitch && e->w == w && e->h == h) {
+            img = e->img; s_xs[i] = s_xs[--s_xs_n]; continue;
+        }
+        if (eng_xs_overlaps(e, dloc, doff, dpitch, w * 4u, h)) { eng_xs_store(i, "overlapped by a new copy"); continue; }
+        i++;
+    }
+    if (!img)
+        for (u32 i = 0; i < s_xs_nimg; i++)
+            if (s_xs_img_w[i] == w && s_xs_img_h[i] == h) {
+                int used = 0;
+                for (u32 k = 0; k < s_xs_n; k++) used |= s_xs[k].img == s_xs_imgs[i];
+                if (!used) { img = s_xs_imgs[i]; break; }
+            }
+    if (!img) {
+        if (s_xs_nimg >= ENG_XS_MAX) return 0;
+        img = g.be->color_target_create(g.be->user, RSX_BE_FMT_R8G8B8A8, w, h, NULL, 0);
+        if (!img) return 0;
+        s_xs_imgs[s_xs_nimg] = img; s_xs_img_w[s_xs_nimg] = w; s_xs_img_h[s_xs_nimg] = h; s_xs_nimg++;
+    }
+    if (s_xs_n >= ENG_XS_MAX) return 0;
+    g.be->color_target_copy(g.be->user, s->handle, x, y, img, 0, 0, w, h);
+    s_xs[s_xs_n++] = (eng_xshadow){ dloc, doff, dpitch, w, h, img };
+    static int said;
+    if (!said) { said = 1;
+                 fprintf(stderr, "[rsx engine] RSX_ENGINE_XFER_SHADOW: first copy kept on the GPU "
+                                 "(surface 0x%08X -> %u:0x%08X %ux%u)\n", s->offset, dloc, doff, w, h); }
+    if (eng_xs_log())
+        fprintf(stderr, "[rsx engine] xfer shadow: out surface 0x%08X at %u,%u %ux%u -> %u:0x%08X\n",
+                s->offset, x, y, w, h, dloc, doff);
+    return 1;
+}
+
+int rsx_draw_engine_xfer_back(u32 sloc, u32 soff, u32 spitch,
+                              u32 dloc, u32 doff, u32 dpitch, u32 w, u32 h)
+{
+    if (!s_xs_n || !w || !h || !eng_xs_on()) return 0;
+    for (u32 i = 0; i < s_xs_n; i++) {
+        const eng_xshadow* e = &s_xs[i];
+        if (e->loc != sloc || e->pitch != spitch || soff < e->off) continue;
+        const u32 d = soff - e->off, sy = d / spitch, sxb = d % spitch;
+        if (sxb % 4u || sxb / 4u + w > e->w || sy + h > e->h) continue;
+        u32 xb = 0, y = 0;
+        const u32 slot = eng_surface_at(dloc, doff, dpitch, &xb, &y);
+        if (slot == ENG_INVALID) return 0;
+        eng_surface* s = &g.surfaces[slot];
+        if (s->fmt != RSX_BE_FMT_R8G8B8A8 || xb % 4u || xb / 4u + w > s->w || y + h > s->h) return 0;
+        g.be->color_target_copy(g.be->user, e->img, sxb / 4u, sy, s->handle, xb / 4u, y, w, h);
+        s->guest_dirty = 1;     /* the guest bytes under it were not written */
+        if (eng_xs_log())
+            fprintf(stderr, "[rsx engine] xfer shadow: back %u:0x%08X %ux%u -> surface 0x%08X at %u,%u\n",
+                    sloc, soff, w, h, s->offset, xb / 4u, y);
+        return 1;
+    }
+    return 0;
 }
 
 static u32 eng_current_surface(void)
@@ -4564,6 +4737,8 @@ void rsx_draw_engine_shutdown(void)
         if (g.zdepths[i].dbz_copy) g.be->texture_release(g.be->user, g.zdepths[i].dbz_copy);
         if (g.zdepths[i].handle) g.be->depth_target_release(g.be->user, g.zdepths[i].handle);
     }
+    for (u32 i = 0; i < s_xs_nimg; i++)
+        if (g.ready && g.be->color_target_release) g.be->color_target_release(g.be->user, s_xs_imgs[i]);
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
     rsx_draw_engine_set_guest_memory(NULL, NULL);
@@ -4573,6 +4748,7 @@ void rsx_draw_engine_shutdown(void)
     free(g.tex_staging); free(g.vp_cb); free(g.fp_cb); free(g.indices);
     const rsx_draw_backend* be = g.be;
     memset(&g, 0, sizeof g);
+    s_xs_n = 0; s_xs_nimg = 0;
     g.be = be;
 }
 

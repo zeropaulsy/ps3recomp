@@ -2768,6 +2768,34 @@ static void vk_eng_color_target_write(void* user, u32 surface, u32 x, u32 y,
     vk_eng_upload_region(o->im.img, 0, 0, x, y, w, h, (size_t)w * o->bpp, h, rows, row_bytes);
 }
 
+/* A rectangle of one colour target copied into another on the GPU, joining
+ * the open batch (RSX_ENGINE_XFER_SHADOW: a 2D transfer out to guest memory
+ * and back kept on the GPU). */
+static void vk_eng_color_target_copy(void* user, u32 src, u32 sx, u32 sy,
+                                     u32 dst, u32 dx, u32 dy, u32 w, u32 h)
+{
+    (void)user;
+    vk_eng_obj* s = vk_eng_get(src, VK_ENG_COLOR);
+    vk_eng_obj* d = vk_eng_get(dst, VK_ENG_COLOR);
+    if (!s || !d || s == d || s->fmt != d->fmt || !w || !h ||
+        sx + w > s->w || sy + h > s->h || dx + w > d->w || dy + h > d->h) return;
+    const int batched = vk_eb_active();
+    if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) return;
+    vk_barrier_image(s->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(d->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkImageCopy c = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffset = { (int32_t)sx, (int32_t)sy, 0 },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffset = { (int32_t)dx, (int32_t)dy, 0 },
+        .extent = { w, h, 1 },
+    };
+    pvkCmdCopyImage(s_vk.cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, d->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    vk_barrier_image(d->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    if (batched) vk_eb_recorded();
+    else vk_submit_and_wait();
+}
+
 static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                             void* out, u32 out_pitch)
 {
@@ -4741,6 +4769,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .readback             = vk_eng_readback,
     .depth_readback       = vk_eng_depth_readback,
     .color_target_write   = vk_eng_color_target_write,
+    .color_target_copy    = vk_eng_color_target_copy,
     /* Every draw and every upload submits and waits, so an upload runs after
      * each earlier draw that sampled the old bytes has completed. */
     .texture_upload_ordered = 1,
