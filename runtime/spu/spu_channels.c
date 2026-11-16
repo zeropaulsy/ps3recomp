@@ -2276,10 +2276,12 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
  * keeps in its own data can be lifted. A body larger than one DMA arrives as
  * consecutive GETs (contiguous EA and LS); those are appended to the same
  * file. One file per source EA: ovl_<ea>.bin. */
-static void spu_ovl_dump(spu_context* ctx, uint32_t ea, uint32_t lsa, const uint8_t* ls, uint32_t size)
+/* -1 until the first GET reads SPU_DUMP_OVL; the caller tests it inline. */
+static int s_ovl_dump_on = -1;
+static SPU_NOINLINE_COLD void spu_ovl_dump(spu_context* ctx, uint32_t ea, uint32_t lsa, const uint8_t* ls, uint32_t size)
 {
     static int s_on = -1; static char s_dir[400]; static uint32_t s_lsa = 0x5000;
-    if (s_on < 0) { const char* e = getenv("SPU_DUMP_OVL"); s_on = e && *e;
+    if (s_on < 0) { const char* e = getenv("SPU_DUMP_OVL"); s_on = e && *e; s_ovl_dump_on = s_on;
         if (s_on) { snprintf(s_dir, sizeof s_dir, "%s", e);
                     char* c = strchr(s_dir, ','); if (c) { *c = 0; s_lsa = (uint32_t)strtoul(c + 1, 0, 0); } } }
     if (!s_on) return;
@@ -2325,7 +2327,7 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
-    spu_ovl_dump(ctx, ea, lsa, ls, size);
+    if (__builtin_expect(s_ovl_dump_on != 0, 0)) spu_ovl_dump(ctx, ea, lsa, ls, size);
     for (unsigned slot = 0; slot < 4; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;

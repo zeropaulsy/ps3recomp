@@ -18,6 +18,7 @@
 #include "spu_context.h"
 #include "../../include/ps3emu/log_first.h"
 #include "spu_coherency.h"
+#include "spu_coh_bitmap.h"   /* spu_coh_line_reserved: the PUT path tests lines inline */
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -38,6 +39,7 @@ extern uint8_t* vm_base;
  * Queries the page state and demand-commits on first touch; the whole
  * [ea, ea+size) range must be committed and accessible.
  * Returns 1 if the range is safe to memcpy. */
+static inline SPU_NOINLINE_COLD int mfc_ea_range_commit_slow(uint32_t e, uint32_t size);
 static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
 {
     /* The VM reserves the full 32-bit guest space but only commits specific
@@ -49,6 +51,17 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
     if (size == 0) return 0;
     if ((uint64_t)e + (uint64_t)size > 0x100000000ull) return 0;   /* past 4 GB */
     if (!vm_base) return 0;
+    /* Both pages already known: the steady state, inline. The query loop
+     * lives out of line so its calls do not make every DMA spill its state
+     * to the stack (most of mfc_do_transfer's samples were those reloads). */
+    { extern uint8_t g_vm_page_bitmap[65536 / 8];
+      const uint32_t p0 = e >> 16, p1 = (e + size - 1) >> 16;
+      if ((g_vm_page_bitmap[p0 >> 3] >> (p0 & 7)) & (g_vm_page_bitmap[p1 >> 3] >> (p1 & 7)) & 1)
+          return 1; }
+    return mfc_ea_range_commit_slow(e, size);
+}
+static inline SPU_NOINLINE_COLD int mfc_ea_range_commit_slow(uint32_t e, uint32_t size)
+{
     /* Committed-page bitmap as a self-healing CACHE of VirtualQuery. The
      * demand-commit fault handler seeds it, but regions the host commits
      * directly (the D3D12 backend's VRAM window never faults) start unseeded
@@ -856,7 +869,6 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * snapshot may be torn, so it gets its event and loses its reservation
          * rather than committing against a line it never saw whole. */
         {
-            extern int  spu_coh_is_reserved(uint32_t);
             extern void spu_coh_notify_write(uint32_t);
             extern void spu_coh_notify_write_except(uint32_t, const void*);
             extern void spu_lockline_lock(void);
@@ -867,7 +879,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
             int span_reserved = 0;
             for (uint32_t a = a0; ; a += 128u) {
-                if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+                if (spu_coh_line_reserved(a)) { span_reserved = 1; break; }
                 if (a == a1) break;
             }
             /* Lines the unlocked pass left for the locked one: a 16 KiB
@@ -879,7 +891,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 for (uint32_t a = a0; ; a += 128u, i++) {
                     const uint32_t lo = a > ea32 ? a - ea32 : 0u;
                     const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
-                    if (spu_coh_is_reserved(a)) locked_lines[i >> 6] |= 1ull << (i & 63u);
+                    if (spu_coh_line_reserved(a)) locked_lines[i >> 6] |= 1ull << (i & 63u);
                     else memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
                     if (a == a1) break;
                 }
@@ -891,7 +903,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     if ((locked_lines[i >> 6] >> (i & 63u)) & 1u) {
                         memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
                         spu_coh_notify_write_except(a, spu);
-                    } else if (spu_coh_is_reserved(a)) {
+                    } else if (spu_coh_line_reserved(a)) {
                         spu_coh_notify_write_except(a, spu);   /* reserved after its copy */
                     }
                     if (a == a1) break;
@@ -901,14 +913,14 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 spu_lockline_lock();
                 memcpy(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
-                    if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
+                    if (spu_coh_line_reserved(a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
                 spu_lockline_unlock();
             } else {
                 memcpy(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
-                    if (spu_coh_is_reserved(a)) {
+                    if (spu_coh_line_reserved(a)) {
                         spu_lockline_lock();
                         spu_coh_notify_write_except(a, spu);
                         spu_lockline_unlock();
