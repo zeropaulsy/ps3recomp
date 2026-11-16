@@ -30,7 +30,7 @@ static DWORD WINAPI waiter(LPVOID p)
     AcquireSRWLockExclusive(&si->lock);
     waiting = 1;
     while (!__atomic_load_n(&si->kick, __ATOMIC_ACQUIRE))
-        SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
+        SleepConditionVariableSRW(spurs_kwake(si), &si->lock, INFINITE, 0);
     woken = 1;
     ReleaseSRWLockExclusive(&si->lock);
     return 0;
@@ -43,6 +43,7 @@ int main(void)
     si = &s_inst[0];
     InitializeSRWLock(&si->lock);
     InitializeConditionVariable(&si->wake);
+    InitializeConditionVariable(&si->kwake);
     __atomic_store_n(&si->ea, SPURS_EA, __ATOMIC_RELEASE);
     si->kernel_live = 1;
 
