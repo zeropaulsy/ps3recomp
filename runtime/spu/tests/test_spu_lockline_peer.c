@@ -444,6 +444,140 @@ static void test_racing_write_ends_lockfree_reservation(void)
 }
 
 /* ===========================================================================
+ * Holders without a reservation are swept from the walk list
+ *
+ * Every 1024 notifier walks, a holder that had no reservation at two sweeps in
+ * a row is dropped (spu_coh_sweep). Dropping one must change no notification:
+ * a dropped context relists itself, under the lock, on its next GETLLAR, and a
+ * holder that does hold a reservation is never dropped.
+ * ===========================================================================*/
+static void walk_unrelated(unsigned n)
+{
+    for (unsigned i = 0; i < n; i++) {
+        spu_lockline_lock();
+        spu_coh_notify_write(LINE_D + 0x100);
+        spu_lockline_unlock();
+    }
+}
+
+static void test_idle_holder_is_swept(void)
+{
+    reset_pair();
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
+    spu_atomic(&g_b, LSA_B, LINE_A, MFC_GETLLAR_CMD);
+    stage(&g_a, LSA_A, 0xA0, 128);
+    spu_atomic(&g_a, LSA_A, LINE_B, MFC_GETLLAR_CMD);   /* retarget g_a ... */
+    stage(&g_a, LSA_A, 0xA0, 128);
+    spu_atomic(&g_a, LSA_A, LINE_B, MFC_PUTLLC_CMD);    /* ... and consume it */
+    CHECK(g_a.resv_valid == 0);
+
+    walk_unrelated(2100);   /* at least two sweeps */
+    TEST("a holder without a reservation at two sweeps is dropped from the walk list");
+    CHECK(g_a.coh_listed == 0);
+    TEST("...and a holder with one is kept, reservation intact");
+    CHECK(g_b.coh_listed == 1);
+    CHECK(g_b.resv_valid == 1);
+    CHECK_EQ_U32(g_b.event_status, 0);
+
+    TEST("a dropped holder's next GETLLAR takes the lock and lists it again");
+    CHECK(llar_completes_under_held_lock(LINE_A) == 0);
+    CHECK(g_a.coh_listed == 1);
+    CHECK(g_a.resv_valid == 1);
+
+    TEST("...so a peer's commit still ends that reservation");
+    stage(&g_b, LSA_B, 0xB0, 128);
+    spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLC_CMD);
+    CHECK_EQ_U32(g_b.atomic_stat, 0);
+    CHECK_EQ_U32(g_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    CHECK(g_a.resv_valid == 0);
+}
+
+/* A sweep racing a lock-free GETLLAR. Each round g_a starts without a
+ * reservation while the writer runs two sweeps' worth of walks and then
+ * writes LINE_A; g_a's GETLLAR lands somewhere in between. Afterwards g_a must
+ * hold either a valid reservation that a peer's write still ends, or none. A
+ * reservation published by the fast path just as the sweep dropped its
+ * context would be valid and unlisted: no writer would ever end it. */
+#define SWEEP_ROUNDS 3000
+static atomic_ulong g_sweep_relists;
+static void* sweep_reader(void* arg)
+{
+    (void)arg;
+    for (int k = 1; k <= SWEEP_ROUNDS; k++) {
+        while (atomic_load(&g_race_go) != k) { }
+        race_delay((unsigned)(k * 7919) % 6000u);
+        if (!__atomic_load_n(&g_a.coh_listed, __ATOMIC_RELAXED))
+            atomic_fetch_add(&g_sweep_relists, 1);   /* dropped: this GETLLAR relists */
+        spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
+        atomic_store(&g_race_reader_done, k);
+    }
+    return NULL;
+}
+
+static void* sweep_writer(void* arg)
+{
+    (void)arg;
+    for (int k = 1; k <= SWEEP_ROUNDS; k++) {
+        while (atomic_load(&g_race_go) != k) { }
+        walk_unrelated(2048);
+        spu_lockline_lock();
+        memset(g_guest_mem + LINE_A, (uint8_t)(k % 255 + 1), 128);
+        spu_coh_notify_write(LINE_A);
+        spu_lockline_unlock();
+        atomic_store(&g_race_writer_done, k);
+    }
+    return NULL;
+}
+
+static void test_sweep_racing_lockfree_getllar(void)
+{
+    reset_pair();
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);   /* registers, marks */
+    atomic_store(&g_race_go, 0);
+    atomic_store(&g_race_reader_done, 0);
+    atomic_store(&g_race_writer_done, 0);
+
+    pthread_t r, w;
+    if (pthread_create(&r, NULL, sweep_reader, NULL) != 0) {
+        TEST("sweep race threads start"); CHECK(0); return;
+    }
+    if (pthread_create(&w, NULL, sweep_writer, NULL) != 0) {
+        atomic_store(&g_race_go, -1);
+        TEST("sweep race threads start"); CHECK(0); return;
+    }
+
+    atomic_store(&g_sweep_relists, 0);
+    unsigned long kept = 0, ended = 0, unbroken = 0, stale_kept = 0;
+    for (int k = 1; k <= SWEEP_ROUNDS; k++) {
+        g_a.resv_valid = 0;          /* as after a consumed PUTLLC */
+        g_a.event_status = 0;
+        atomic_store(&g_race_go, k);
+        while (atomic_load(&g_race_reader_done) != k ||
+               atomic_load(&g_race_writer_done) != k) { }
+        if (!g_a.resv_valid) { ended++; continue; }
+        kept++;
+        if (memcmp(g_a.resv_line, g_guest_mem + LINE_A, 128) != 0) stale_kept++;
+        g_a.event_status = 0;
+        memset(g_b.ls + LSA_B, 0xEE, 128);
+        spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLUC_CMD);
+        if (g_a.resv_valid || !(g_a.event_status & SPU_EVENT_LR)) unbroken++;
+    }
+    pthread_join(r, NULL);
+    pthread_join(w, NULL);
+    const unsigned long relisted = atomic_load(&g_sweep_relists);
+
+    printf("  sweep vs lock-free GETLLAR: %lu kept, %lu ended, %lu relisted\n",
+           kept, ended, relisted);
+    TEST("a reservation that survives a racing sweep has the current line");
+    CHECK(stale_kept == 0);
+    TEST("...and a peer's write still ends it");
+    CHECK(unbroken == 0);
+    TEST("...and the race exercised dropping and relisting");
+    CHECK(relisted > 0);
+    CHECK(kept > 0);
+}
+
+/* ===========================================================================
  * A peer's plain DMA PUT
  * ===========================================================================*/
 static void test_plain_put_breaks_peer(void)
@@ -685,6 +819,8 @@ int main(void)
     test_putlluc_breaks_peer();
     test_registered_getllar_skips_the_lock();
     test_racing_write_ends_lockfree_reservation();
+    test_idle_holder_is_swept();
+    test_sweep_racing_lockfree_getllar();
     test_plain_put_breaks_peer();
     test_plain_put_elsewhere_is_quiet();
     test_wide_put_finds_the_reserved_line();

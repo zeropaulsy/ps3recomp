@@ -982,10 +982,62 @@ extern "C" void ppu_resv_break_store(uint64_t ea)
  * it, and the per-word value-CAS cannot see that. Havok keeps its job queue in
  * lines both sides update; letting the PPU commit over an SPU update corrupted
  * the queue into a cycle that an SPU task then walked forever.
- * Called (via spu_coh_notify_write) for every write to an SPU-reserved line. */
+ * Called (via spu_coh_notify_write) for every write to an SPU-reserved line.
+ *
+ * Only lines a PPU stwcx./stdcx. has ever targeted are walked (g_ppu_cas_lines,
+ * one bit per line, set and never cleared). A reservation is only worth
+ * breaking if a store-conditional will check it, and the first store-
+ * conditional on a line marks it, breaks every PPU reservation on it and fails
+ * (ppu_cas_line_mark), so a reservation taken while the line was unmarked --
+ * when writers skipped this walk -- can never commit. The test below is
+ * ordered after the writer's data store by the notifier's fence; the mark is a
+ * locked RMW. Either the writer sees the mark and walks, or the marking
+ * thread's next lwarx reads the written data. In the level this skipped the
+ * walk of all 28 PPU contexts on nearly every SPU atomic commit.
+ * PPU_CAS_LINES=0 walks every line as before. */
+static unsigned char g_ppu_cas_lines[(1u << 25) / 8];
+static int g_ppu_cas_filter = -1;
+static inline int ppu_cas_filter_on()
+{
+    int f = g_ppu_cas_filter;
+    if (__builtin_expect(f < 0, 0)) {
+        const char* e = getenv("PPU_CAS_LINES");
+        f = g_ppu_cas_filter = !(e && e[0] == '0');
+    }
+    return f;
+}
+static void ppu_resv_break_line_all(uint32_t line)
+{
+    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    for (long i = 0; i < n; i++) {
+        ppu_context* c = g_resv_ctxs[i];
+        if (c && c->reserve_addr < PPU_RESV_INVALID &&
+            ((uint32_t)c->reserve_addr & ~127u) == line)
+            c->reserve_addr = PPU_RESV_INVALID;
+    }
+}
+/* Called by a store-conditional under its slot lock. Returns 0 if this is the
+ * first store-conditional on ea's line: the line is marked now, every PPU
+ * reservation on it (the caller's included) is broken, and the caller fails,
+ * which the architecture allows a stwcx. to do at any time. */
+static inline int ppu_cas_line_mark(uint32_t ea)
+{
+    if (!ppu_cas_filter_on()) return 1;
+    const uint32_t l = ea >> 7;
+    const unsigned char bit = (unsigned char)(1u << (l & 7));
+    if (__atomic_load_n(&g_ppu_cas_lines[l >> 3], __ATOMIC_RELAXED) & bit) return 1;
+    __atomic_fetch_or(&g_ppu_cas_lines[l >> 3], bit, __ATOMIC_SEQ_CST);
+    ppu_resv_break_line_all(ea & ~127u);
+    return 0;
+}
 extern "C" void ppu_resv_break_line(uint32_t ea)
 {
     const uint32_t line = ea & ~127u;
+    if (ppu_cas_filter_on()) {
+        const uint32_t l = ea >> 7;
+        if (!(__atomic_load_n(&g_ppu_cas_lines[l >> 3], __ATOMIC_RELAXED) & (1u << (l & 7))))
+            return;
+    }
     ppu_context* self = g_active_ctx;
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
     for (long i = 0; i < n; i++) {
@@ -1050,6 +1102,7 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
     volatile LONG* L = resv_slot(ea);
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }   /* reservation lost */
+    if (!ppu_cas_line_mark((uint32_t)ea)) { resv_unlock(L); return 0; }   /* first on this line */
     /* On a line an SPU has reserved, take the lock-line lock around the CAS and
      * notify: the same serialization the coherent stores use, so a PPU commit
      * cannot land inside an SPU PUTLLC's compare/commit window (nor the
@@ -1141,6 +1194,7 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     volatile LONG* L = resv_slot(ea);   /* ea and ea+4 share a 16-byte-block slot */
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
+    if (!ppu_cas_line_mark((uint32_t)ea)) { resv_unlock(L); return 0; }   /* as in ppu_stwcx32 */
     int coh = spu_coh_is_reserved((uint32_t)ea);
     if (coh) spu_lockline_lock();
     if (coh && self && self->reserve_addr != (uint32_t)ea) {   /* as in ppu_stwcx32 */

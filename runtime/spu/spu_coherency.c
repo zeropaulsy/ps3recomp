@@ -151,6 +151,16 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
  * few entries ahead. */
 static spu_context** s_coh_ctxs;
 static unsigned s_coh_n, s_coh_cap;
+/* s_coh_idle[i]: holder i had no reservation at the last sweep (see
+ * spu_coh_sweep). Parallel to s_coh_ctxs, same lock. */
+static unsigned char* s_coh_idle;
+static unsigned s_coh_walks;
+static inline void spu_coh_remove_at(unsigned i)   /* order does not matter */
+{
+    --s_coh_n;
+    s_coh_ctxs[i] = s_coh_ctxs[s_coh_n];
+    s_coh_idle[i] = s_coh_idle[s_coh_n];
+}
 #define SPU_COH_PREFETCH 4
 static inline void spu_coh_prefetch_holder(unsigned i)
 {
@@ -179,14 +189,17 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     if (s_coh_n == s_coh_cap) {
         unsigned cap = s_coh_cap ? s_coh_cap * 2u : 64u;
         spu_context** grown = (spu_context**)realloc(s_coh_ctxs, cap * sizeof(*grown));
-        if (!grown) {
+        unsigned char* idle = grown ? (unsigned char*)realloc(s_coh_idle, cap) : NULL;
+        if (grown) s_coh_ctxs = grown;
+        if (!grown || !idle) {
             fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
             fflush(stderr);
             abort(); /* A missed holder loses invalidation events, including ABA. */
         }
-        s_coh_ctxs = grown;
+        s_coh_idle = idle;
         s_coh_cap = cap;
     }
+    s_coh_idle[s_coh_n] = 0;
     s_coh_ctxs[s_coh_n++] = ctx;
     __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED);
 }
@@ -241,7 +254,7 @@ void spu_coh_unregister(spu_context* ctx)
     spu_lockline_lock();
     for (unsigned i = 0; i < s_coh_n; i++) {
         if (s_coh_ctxs[i] != ctx) continue;
-        s_coh_ctxs[i] = s_coh_ctxs[--s_coh_n];   /* order does not matter */
+        spu_coh_remove_at(i);
         break;
     }
     __atomic_store_n(&ctx->coh_listed, 0, __ATOMIC_RELAXED);
@@ -264,7 +277,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
             if (PS3_LOG_FIRST(_n, 16))
                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
                         (void*)c, s_coh_ctxs[i]->image_id);
-            s_coh_ctxs[i] = s_coh_ctxs[--s_coh_n];   /* re-check slot i */
+            spu_coh_remove_at(i);   /* re-check slot i */
         } else {
             i++;
         }
@@ -362,14 +375,68 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
     __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
     __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    /* A sweep may have dropped ctx from s_coh_ctxs since the check above.
+     * Its store of coh_listed = 0 and this reader's resv_valid = 1 are the
+     * same store-buffering pair: one of the two loads sees the other store.
+     * Either the sweep saw the reservation and kept the entry, or this load
+     * sees the entry gone and the caller takes the locked path, which lists
+     * ctx again before it copies. The reservation published above is
+     * unlisted meanwhile, but the line is not copied until that path holds
+     * the lock, so a write it misses is one the copy already contains. */
+    if (!__atomic_load_n(&ctx->coh_listed, __ATOMIC_RELAXED))
+        return 0;
     return 1;
+}
+
+/* Dropping holders that no longer reserve anything.
+ *
+ * s_coh_ctxs only ever grew between a context's first GETLLAR and the end
+ * of its life, and LBP2 keeps a pool of job contexts per worker thread: 86
+ * entries in the level, about 25 of them holding a reservation at any
+ * moment, and every notifier read resv_valid in each of the others (one
+ * cache line per context) on every PUTLLC, PUTLLUC and PUT to a reserved
+ * line. An entry without a reservation takes no part in a walk, so removing
+ * it changes no notification; the only cost is that the context's next
+ * GETLLAR takes the locked path once to list itself again.
+ *
+ * Every SPU_COH_SWEEP_WALKS walks, under the lock: an entry without a
+ * reservation at two sweeps in a row is removed. Removal clears coh_listed
+ * first and re-reads resv_valid after a fence, against the lockless GETLLAR
+ * (spu_coh_reserve_fast), which publishes resv_valid and then re-reads
+ * coh_listed after its own fence. SPU_COH_SWEEP=0 keeps every entry. */
+#define SPU_COH_SWEEP_WALKS 1024u
+static int s_coh_sweep_on = -1;
+static SPU_NOINLINE_COLD void spu_coh_sweep(void)
+{
+    if (s_coh_sweep_on < 0) { const char* e = getenv("SPU_COH_SWEEP"); s_coh_sweep_on = !(e && e[0] == '0'); }
+    if (!s_coh_sweep_on) return;
+    for (unsigned i = 0; i < s_coh_n;) {
+        spu_context* c = s_coh_ctxs[i];
+        if (__atomic_load_n(&c->resv_valid, __ATOMIC_RELAXED)) { s_coh_idle[i] = 0; i++; continue; }
+        if (!s_coh_idle[i]) { s_coh_idle[i] = 1; i++; continue; }
+        __atomic_store_n(&c->coh_listed, 0, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&c->resv_valid, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&c->coh_listed, 1, __ATOMIC_RELAXED);
+            s_coh_idle[i] = 0; i++; continue;
+        }
+        spu_coh_remove_at(i);   /* re-check slot i */
+    }
+}
+static inline void spu_coh_count_walk(void)
+{
+    if (__builtin_expect(++s_coh_walks >= SPU_COH_SWEEP_WALKS, 0)) { s_coh_walks = 0; spu_coh_sweep(); }
 }
 
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
-    ppu_resv_break_line(ea);
     spu_coh_writer_fence();
+    /* After the fence: ppu_resv_break_line skips lines no PPU stwcx. has
+     * marked, and that test is the load half of a store-buffering pair with
+     * the stwcx.'s mark (see ppu_resv_break_line). */
+    ppu_resv_break_line(ea);
+    spu_coh_count_walk();
     spu_coh_wake_watches(line);
     for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i);
     for (unsigned i = 0; i < s_coh_n; i++) {
@@ -388,8 +455,12 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
-    ppu_resv_break_line(ea);
     spu_coh_writer_fence();
+    /* After the fence: ppu_resv_break_line skips lines no PPU stwcx. has
+     * marked, and that test is the load half of a store-buffering pair with
+     * the stwcx.'s mark (see ppu_resv_break_line). */
+    ppu_resv_break_line(ea);
+    spu_coh_count_walk();
     spu_coh_wake_watches(line);
     for (unsigned i = 0; i < SPU_COH_PREFETCH; i++) spu_coh_prefetch_holder(i);
     for (unsigned i = 0; i < s_coh_n; i++) {
