@@ -1193,8 +1193,14 @@ class SPULifter:
     def emit_source(self,header_name: str) -> str:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
+        # ctx is __restrict: the local store is reached through ctx->ls, a byte pointer
+        # that usually points into the context itself (ls_store), so without it GCC must
+        # assume every LS store can overwrite ctx->gpr[] and reload the registers after
+        # it, and cannot hoist loop-invariant work (shufb controls) out of loops. The LS
+        # never overlaps the other fields; callees that take ctx still clobber it.
+        # LBP2's Wws jobs: MAIN job lane -1.6% per frame, +1.0% fps.
         for f in self.functions:
-            lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
+            lines.append(f"void {weak}{f.name}(spu_context* __restrict ctx) {{")
             for b in f.body_lines:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")
@@ -1213,7 +1219,7 @@ class SPULifter:
             lines.append(" * function detector did not seed (typically conditional")
             lines.append(" * branches that escape a function's range). */")
             for t in externs:
-                lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx) {{")
+                lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* __restrict ctx) {{")
                 pc = self._pc(t) if self.reloc else f"0x{t:X}u"
                 lines.append(f"    ctx->pc = {pc}; "
                              f"g_spu_trampoline_fn = spu_indirect_branch; return;")
