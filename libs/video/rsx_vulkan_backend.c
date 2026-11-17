@@ -109,7 +109,8 @@
  * headless run never depends on a driver that can present. */
 #define VK_WSI_INSTANCE_FNS(X) \
     X(vkDestroySurfaceKHR) X(vkGetPhysicalDeviceSurfaceSupportKHR) \
-    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR)
+    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) \
+    X(vkGetPhysicalDeviceSurfacePresentModesKHR)
 #define VK_WSI_DEVICE_FNS(X) \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) \
     X(vkAcquireNextImageKHR) X(vkQueuePresentKHR)
@@ -205,6 +206,9 @@ typedef struct vk_state {
     VkCommandBuffer  present_cmd;
     VkFence          present_fence;   /* the copy out of the presented surface */
     VkFence          window_fence;    /* the blit into the swapchain image     */
+    VkCommandBuffer  window_cmd;      /* that blit's own command buffer         */
+    int              window_inflight; /* blit submitted, fence not waited yet   */
+    VkPresentModeKHR window_mode;     /* the swapchain's present mode           */
     int              present_inflight;/* copy submitted, not yet finished      */
     int              present_split;   /* inside rsx_vulkan_backend_present_begin */
     int              present_order;   /* the walker's next command buffer waits */
@@ -1929,6 +1933,25 @@ static int vk_create_swapchain(void)
     for (size_t k = 0; k < 4; k++)
         if (caps.supportedCompositeAlpha & alphas[k]) { alpha = alphas[k]; break; }
 
+    /* PS3RECOMP_VK_PRESENT=fifo|mailbox|immediate|relaxed. Default: MAILBOX when the surface has it, else FIFO.
+     * Under FIFO (vsync) a present can wait for the display -- through XWayland for the compositor too -- and that
+     * wait landed on the thread presenting the game's flips: ~20 fps in a level that runs at its 30 fps cap
+     * headless. MAILBOX never blocks and never tears: the display shows the newest finished frame. */
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;   /* the one mode every driver has */
+    {
+        VkPresentModeKHR want = VK_PRESENT_MODE_MAILBOX_KHR;
+        const char* e = getenv("PS3RECOMP_VK_PRESENT");
+        if (e && !strcmp(e, "fifo"))      want = VK_PRESENT_MODE_FIFO_KHR;
+        if (e && !strcmp(e, "immediate")) want = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        if (e && !strcmp(e, "relaxed"))   want = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+        VkPresentModeKHR modes[16];
+        u32 nm = 16;
+        if (want != mode &&
+            pvkGetPhysicalDeviceSurfacePresentModesKHR(s_vk.phys, s_vk.surface, &nm, modes) >= 0)
+            for (u32 i = 0; i < nm; i++)
+                if (modes[i] == want) { mode = want; break; }
+    }
+
     VkSwapchainKHR old = s_vk.swapchain;
     VkSwapchainCreateInfoKHR sci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
@@ -1938,7 +1961,7 @@ static int vk_create_swapchain(void)
         .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = caps.currentTransform, .compositeAlpha = alpha,
-        .presentMode = VK_PRESENT_MODE_FIFO_KHR,   /* the one mode every driver has */
+        .presentMode = mode,
         .clipped = VK_TRUE, .oldSwapchain = old,
     };
     VkSwapchainKHR sc = VK_NULL_HANDLE;
@@ -1964,7 +1987,11 @@ static int vk_create_swapchain(void)
 
     s_vk.sc_extent = ext;
     s_vk.sc_count = n;
-    VK_LOG("window swapchain %ux%u, %u images, format %d\n", ext.width, ext.height, n, (int)fmt.format);
+    s_vk.window_mode = mode;
+    VK_LOG("window swapchain %ux%u, %u images, format %d, present mode %s\n", ext.width, ext.height, n,
+           (int)fmt.format, mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" :
+           mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" :
+           mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "fifo-relaxed" : "fifo");
     return 0;
 }
 
@@ -2018,6 +2045,13 @@ static void vk_present_window(void)
         vk_swapchain_lost();
         if (!s_vk.windowed || s_vk_resized) return;
     }
+    /* The previous blit, waited for here rather than right after its submit: that wait covered the swapchain image
+     * coming back from the display (its acquire semaphore), up to a refresh or more, with present_mu held. A frame
+     * later it has long finished. Its command buffer and sem_acquire are free again after this. */
+    if (s_vk.window_inflight) {
+        pvkWaitForFences(s_vk.device, 1, &s_vk.window_fence, VK_TRUE, UINT64_MAX);
+        s_vk.window_inflight = 0;
+    }
 
     u32 idx = 0;
     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
@@ -2027,9 +2061,7 @@ static void vk_present_window(void)
         VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); return;
     }
 
-    /* The present's own command buffer: free, since every caller has waited
-     * for its copy (present_fence) first. */
-    VkCommandBuffer cb = s_vk.present_cmd;
+    VkCommandBuffer cb = s_vk.window_cmd;
     if (pvkResetCommandBuffer(cb, 0) != VK_SUCCESS) { VK_LOG("vkResetCommandBuffer (window) failed\n"); return; }
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
@@ -2081,7 +2113,7 @@ static void vk_present_window(void)
     if (vk_queue_submit(&si, s_vk.window_fence) != VK_SUCCESS) {
         VK_LOG("vkQueueSubmit (window) failed\n"); return;
     }
-    pvkWaitForFences(s_vk.device, 1, &s_vk.window_fence, VK_TRUE, UINT64_MAX);
+    s_vk.window_inflight = 1;
 
     VkPresentInfoKHR pi = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -4892,6 +4924,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VK_CHECK(pvkCreateCommandPool(s_vk.device, &pci, NULL, &s_vk.present_pool), "vkCreateCommandPool");
     cai.commandPool = s_vk.present_pool;
     VK_CHECK(pvkAllocateCommandBuffers(s_vk.device, &cai, &s_vk.present_cmd), "vkAllocateCommandBuffers");
+    VK_CHECK(pvkAllocateCommandBuffers(s_vk.device, &cai, &s_vk.window_cmd), "vkAllocateCommandBuffers");
     VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_vk.present_fence), "vkCreateFence");
     VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_vk.window_fence), "vkCreateFence");
 
@@ -4977,6 +5010,7 @@ void rsx_vulkan_backend_shutdown(void)
         while (s_vk.windowed && !SDL_TICKS_PASSED(SDL_GetTicks(), end)) {
             if (rsx_vulkan_backend_pump_messages() != 0) break;
             vk_present_window();         /* FIFO: paced by the display */
+            if (s_vk.window_mode != VK_PRESENT_MODE_FIFO_KHR) SDL_Delay(16);
         }
     }
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
