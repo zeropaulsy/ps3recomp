@@ -444,6 +444,30 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
             }
         interp_stats_bump(s_ie_img, s_ie_pc, s_ie_cnt, owner, key);
     }
+    /* SPU_INTERP_ENTRY_LOG=<n>: the first n entries into the interpreter with the link,
+     * the resident code slots and the first words at the entry (what code is it?). */
+    { static int s_el = -1; static int s_ec;
+      if (s_el < 0) { const char* e = getenv("SPU_INTERP_ENTRY_LOG"); s_el = e ? atoi(e) : 0; }
+      if (s_el && s_ec < s_el) {
+          s_ec++;
+          const uint32_t pc = start_lsa & 0x3FFFC;
+          fprintf(stderr, "[interp-entry] img=%d pc=0x%05X lr=0x%05X stop=0x%05X slots:", ctx->image_id, pc,
+                  ctx->gpr[0]._u32[0] & 0x3FFFF, stop_lsa);
+          for (unsigned s = 0; s < 4; ++s)
+              if (ctx->resident_code[s].image_id)
+                  fprintf(stderr, " [%d @0x%05X+0x%X canon 0x%X]", ctx->resident_code[s].image_id,
+                          ctx->resident_code[s].lsa, ctx->resident_code[s].size, ctx->resident_code[s].canon);
+          fprintf(stderr, " code:");
+          for (unsigned k = 0; k < 8; ++k) {
+              const uint8_t* q = ctx->ls + ((pc + k * 4) & 0x3FFFC);
+              fprintf(stderr, " %02X%02X%02X%02X", q[0], q[1], q[2], q[3]);
+          }
+          fprintf(stderr, "\n");
+          /* SPU_INTERP_ENTRY_LSDUMP=<file>: the whole LS at the last logged entry. */
+          const char* dp = s_ec == s_el ? getenv("SPU_INTERP_ENTRY_LSDUMP") : NULL;
+          FILE* f = dp ? fopen(dp, "wb") : NULL;
+          if (f) { fwrite(ctx->ls, 1, 0x40000, f); fclose(f); fprintf(stderr, "[interp-entry] LS -> %s\n", dp); }
+      } }
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;

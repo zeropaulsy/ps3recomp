@@ -2324,16 +2324,42 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
                 ea, size, os, on, ns, nn); }
 }
 
+/* SPU_OVL_RESLOG=<n>: log the first n resident-code changes (set / cleared by which GET). */
+static SPU_NOINLINE_COLD void spu_ovl_reslog(const spu_context* ctx, const char* what, int img,
+                                             uint32_t base, uint32_t ea, uint32_t lsa, uint32_t size)
+{
+    static int s_n = -1; static int s_c;
+    if (s_n < 0) { const char* e = getenv("SPU_OVL_RESLOG"); s_n = e ? atoi(e) : 0; }
+    if (s_n && PS3_LOG_FIRST(s_c, s_n))
+        fprintf(stderr, "[ovl-res] ctx img=%d %s image %d base=0x%05X by GET ea=0x%08X lsa=0x%05X size=%u pc=0x%05X\n",
+                ctx->image_id, what, img, base, ea, lsa, size, (unsigned)(ctx->pc & SPU_LS_MASK));
+}
+
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
     if (__builtin_expect(s_ovl_dump_on != 0, 0)) spu_ovl_dump(ctx, ea, lsa, ls, size);
+    /* SPU_OVL_PROBE=<lsa>[,<n>]: log the first n (default 2000) GETs that write LS <lsa>, with
+     * the 16 bytes they put there (which body is streamed to that address, and from where). */
+    { static int s_pn = -1; static uint32_t s_pl; static int s_pc;
+      if (s_pn < 0) { const char* e = getenv("SPU_OVL_PROBE"); s_pn = 0;
+          if (e) { char* d; s_pl = (uint32_t)strtoul(e, &d, 16); s_pn = *d == ',' ? atoi(d + 1) : 2000; } }
+      if (s_pn && s_pl >= lsa && s_pl - lsa < size && PS3_LOG_FIRST(s_pc, s_pn)) {
+          const uint8_t* q = ls + (s_pl - lsa);
+          fprintf(stderr, "[ovl-probe] img=%d GET ea=0x%08X lsa=0x%05X size=%u pc=0x%05X ->", ctx->image_id,
+                  ea, lsa, size, (unsigned)(ctx->pc & SPU_LS_MASK));
+          for (int k = 0; k < 16; k += 4) fprintf(stderr, " %02X%02X%02X%02X", q[k], q[k+1], q[k+2], q[k+3]);
+          fprintf(stderr, " head");
+          for (int k = 0; k < 16; k += 4) fprintf(stderr, " %02X%02X%02X%02X", ls[k], ls[k+1], ls[k+2], ls[k+3]);
+          fprintf(stderr, "\n");
+      } }
     for (unsigned slot = 0; slot < 4; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
         uint32_t end = base + ctx->resident_code[slot].size;
         if (lsa < end && lsa + size > base) {
             if (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)) {
+                spu_ovl_reslog(ctx, "CLEAR", ctx->resident_code[slot].image_id, base, ea, lsa, size);
                 ctx->resident_code[slot].image_id = 0;
                 spu_dcache_residency_changed(ctx);
             } else if (ctx->resident_code[slot].verify_state) {
@@ -2373,6 +2399,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].source_index = i;
                     ctx->resident_code[slot].canon = o->canon;
                     spu_dcache_residency_changed(ctx);
+                    spu_ovl_reslog(ctx, "SET", o->image_id, lsa, ea, lsa, size);
                     return;
                 }
                 fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);

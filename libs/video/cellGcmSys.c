@@ -160,6 +160,20 @@ int cellGcm_take_flip_pending(void)
  * keep presenting display buffer 0 for a title that flips through 0xFEAD. */
 static void gcm_set_current_display_buffer(u32 bufferId)
 {
+    /* GCM_HITCH_MS=<n>: one line per frame whose flip came more than n ms after
+     * the previous one. The 10 s averages hide single long frames, which is
+     * what a player sees as a hitch. */
+    { static long long lim = -2; static u64 last = 0, n = 0, t0 = 0;
+      if (lim == -2) { const char* e = getenv("GCM_HITCH_MS"); lim = e ? atoll(e) : -1; }
+      if (lim >= 0) {
+          const u64 now = get_timestamp_ns();
+          if (!t0) t0 = now;
+          ++n;
+          if (last && now - last > (u64)lim * 1000000ull)
+              fprintf(stderr, "[hitch] flip %llu at %.3f s took %.1f ms%c", (unsigned long long)n,
+                      (now - t0) / 1e9, (now - last) / 1e6, 10);
+          last = now;
+      } }
     s_current_display_buffer_id = bufferId;
     if (rsx_draw_engine_enabled())
         rsx_draw_engine_note_flip(bufferId);

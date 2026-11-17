@@ -1481,13 +1481,22 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     /* ran= is the wall time this task spent OUT of the wait (decode/mix work
      * per round) -- decisive for "is the Bink decode CPU-bound". TLS: each
      * task runs on its own host thread. */
-    static _Thread_local unsigned long long s_wait_exit_ms;
+    static _Thread_local unsigned long long s_wait_exit_ms, s_parked_ms;
+    unsigned long long park_start_ms;
     { extern unsigned long long ps3_ms_now(void);
       unsigned long long _now = ps3_ms_now();
+      park_start_ms = _now;
       static unsigned _n = 0; if (_n++ < 200 || (_n % 500) == 0)   /* unsigned: periodic, wrapping is defined */
         fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%u enter task=%u taskset=0x%08X ran=%llums\n",
                 _n, taskId, taskset_ea,
-                s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }
+                s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull);
+      /* SPU_TASK_SLOW_MS=<n>: every round longer than n ms, with the time the task
+       * spent parked before it. Finds a slow FMOD mixer round behind a frame stall. */
+      { static long long slow = -2;
+        if (slow == -2) { const char* e = getenv("SPU_TASK_SLOW_MS"); slow = e ? atoll(e) : -1; }
+        if (slow >= 0 && s_wait_exit_ms && _now - s_wait_exit_ms > (unsigned long long)slow)
+            fprintf(stderr, "[task-slow] taskset 0x%08X task %u round %llu ms (parked %llu ms before) at %llu ms\n",
+                    taskset_ea, taskId, _now - s_wait_exit_ms, s_parked_ms, _now); } }
     /* LBP_SYNC_ACK: taskset sync-lane bookkeeping. On real SPURS the taskset
      * POLICY MODULE advances the per-SPU progress lanes (sync+0x40+16*row:
      * ticket u16 @+0, consumer lanes @+2..) as tasks are processed; our HLE
@@ -1571,7 +1580,8 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
     spu_serial_acquire();       /* resume: re-take the serial lock */
     { extern unsigned long long ps3_ms_now(void);
-      s_wait_exit_ms = ps3_ms_now(); }   /* stamp for the next entry's ran= */
+      s_wait_exit_ms = ps3_ms_now();     /* stamp for the next entry's ran= */
+      s_parked_ms = s_wait_exit_ms - park_start_ms; }
     return 0;
 }
 
