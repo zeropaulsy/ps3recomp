@@ -862,7 +862,11 @@ SPU__XR_INLINE u128 spu__xr_st(__m128i v) { u128 r; _mm_storeu_si128((__m128i*)r
  * biased exponent 0 is +0. A zero factor times an operand with biased exponent 255 gives a NaN
  * here, which fails spu__xr_inrange and takes the exact lane path. */
 SPU__XR_INLINE __m128i spu__xr_pz(__m128 s) {
-    return _mm_castps_si128(_mm_and_ps(s, _mm_cmpneq_ps(s, _mm_setzero_ps()))); }
+    /* s + +0: under round toward zero, -0 + +0 is +0 (IEEE: opposite-sign zeros sum to +0 in every
+     * mode but round toward -inf) and any other s comes back unchanged (s is already a flushed
+     * result). One add instead of compare + and; the compiler keeps it, as x + 0.0 is not x when
+     * signed zeros are honoured (no -ffast-math / -fno-signed-zeros). */
+    return _mm_castps_si128(_mm_add_ps(s, _mm_setzero_ps())); }
 SPU__XR_INLINE __m128i spu__xr_inrange(__m128 s) {
     return _mm_castps_si128(_mm_cmplt_ps(_mm_andnot_ps(_mm_set1_ps(-0.0f), s), _mm_set1_ps(0x1.fffffep127f))); }
 SPU__XR_INLINE int spu__xr_all4(__m128i m) { return _mm_movemask_ps(_mm_castsi128_ps(m)) == 0xF; }
