@@ -56,6 +56,29 @@ static inline void spu_arch_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST
  * are unaffected (W is identity modulo the within-word reversal). */
 #define SPU_W(P) (((P) & ~3) | (3 - ((P) & 3)))
 
+/* Opaque register reads, emitted by tools/spu_far_reads.py for operands written long
+ * before (see there): the compiler cannot forward the stored value, so it reads ctx
+ * instead of keeping the value in a host register and spilling it to the stack.
+ * SPU_FAR(ctx->gpr[N]) is the whole register, SPU_FAR_S(ctx->gpr[N]._u32[0]) an integer
+ * member. Plain reads on other hosts (and with -DSPU_NO_FAR_READS). */
+#if defined(__x86_64__) && defined(__GNUC__) && defined(__SSE2__) && !defined(SPU_NO_FAR_READS)
+typedef long long spu__v2di __attribute__((vector_size(16)));
+static inline __attribute__((always_inline)) u128 spu_far_q(const u128 *p) {
+    spu__v2di v;
+#ifdef __AVX__
+    __asm__("vmovdqa %1, %0" : "=x"(v) : "m"(*p));
+#else
+    __asm__("movdqa %1, %0" : "=x"(v) : "m"(*p));
+#endif
+    u128 r; memcpy(&r, &v, 16); return r;
+}
+#define SPU_FAR(x) spu_far_q(&(x))
+#define SPU_FAR_S(x) __extension__({ __typeof__(x) spu__fv; __asm__("mov%z0 %1, %0" : "=r"(spu__fv) : "m"(x)); spu__fv; })
+#else
+#define SPU_FAR(x) (x)
+#define SPU_FAR_S(x) (x)
+#endif
+
 #if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
 #include <arm_neon.h>
 /* NEON forms of the hot integer ops. Each scalar definition stays as spu_X_ref
@@ -86,19 +109,47 @@ static inline uint8x16_t spu__iota(void) {
 #define SPU__XI static inline __attribute__((always_inline))
 SPU__XI __m128i spu__xl(u128 a) { __m128i v; memcpy(&v, &a, 16); return v; }
 SPU__XI u128 spu__xs(__m128i v) { u128 r; memcpy(&r, &v, 16); return r; }
-/* Host lane h holds SPU byte h^3. ir[h] = the SPU source byte for the result's SPU byte h^3
- * (>= 16 unsigned: zero); the host table index is ir ^ 3, bit 7 set for zero. */
+/* Quadword byte rotates/shifts (rotqby, shlqby, rotqmby and their bi/immediate forms):
+ * spu__xrotq(a, s) rotates left by s (0-15), spu__xshlq / spu__xshrq shift left / right by
+ * s (0-31; 16+ gives zero). Host lane h holds SPU byte h^3.
+ * Default: one pshufb with a control row from a table (row s, lane h = host index of the
+ * source byte, 0x80 for zero), so a variable shift is and + shl + pshufb with a memory
+ * operand and an immediate one is a single pshufb on a constant. These ops are a large
+ * share of the lifted job code (f8000: 125 of 645 ops), whose speed is bound by the
+ * instruction fetch: the vector form below was 8 ops (4 for an immediate, whose
+ * out-of-range test GCC does not fold). -DSPU_XPERM_VEC selects that vector form. */
+#if !defined(SPU_XPERM_VEC)
+#define SPU__TROT(s, h) ((((((h) ^ 3) + (s)) & 15) ^ 3))
+#define SPU__TSHL(s, h) ((((h) ^ 3) + (s)) < 16 ? ((((h) ^ 3) + (s)) ^ 3) : 0x80)
+#define SPU__TSHR(s, h) ((((h) ^ 3) - (s)) >= 0 ? ((((h) ^ 3) - (s)) ^ 3) : 0x80)
+#define SPU__TROW(F, s) { F(s, 0), F(s, 1), F(s, 2),  F(s, 3),  F(s, 4),  F(s, 5),  F(s, 6),  F(s, 7), \
+                          F(s, 8), F(s, 9), F(s, 10), F(s, 11), F(s, 12), F(s, 13), F(s, 14), F(s, 15) }
+#define SPU__TR4(F, s) SPU__TROW(F, (s)), SPU__TROW(F, (s) + 1), SPU__TROW(F, (s) + 2), SPU__TROW(F, (s) + 3)
+#define SPU__TR16(F, s) SPU__TR4(F, (s)), SPU__TR4(F, (s) + 4), SPU__TR4(F, (s) + 8), SPU__TR4(F, (s) + 12)
+__attribute__((aligned(16), unused)) static const uint8_t spu__xtrot[16][16] = { SPU__TR16(SPU__TROT, 0) };
+__attribute__((aligned(16), unused)) static const uint8_t spu__xtshl[32][16] = { SPU__TR16(SPU__TSHL, 0), SPU__TR16(SPU__TSHL, 16) };
+__attribute__((aligned(16), unused)) static const uint8_t spu__xtshr[32][16] = { SPU__TR16(SPU__TSHR, 0), SPU__TR16(SPU__TSHR, 16) };
+SPU__XI u128 spu__xtbl(u128 a, const uint8_t *row) {
+    return spu__xs(_mm_shuffle_epi8(spu__xl(a), _mm_load_si128((const __m128i *)row)));
+}
+SPU__XI u128 spu__xrotq(u128 a, unsigned s) { return spu__xtbl(a, spu__xtrot[s & 15]); }
+SPU__XI u128 spu__xshlq(u128 a, unsigned s) { return spu__xtbl(a, spu__xtshl[s & 31]); }
+SPU__XI u128 spu__xshrq(u128 a, unsigned s) { return spu__xtbl(a, spu__xtshr[s & 31]); }
+#else
+/* ir[h] = the SPU source byte for the result's SPU byte h^3 (>= 16 unsigned: zero); the host
+ * table index is ir ^ 3, bit 7 set for zero. */
 SPU__XI u128 spu__xperm(u128 a, __m128i ir) {
     const __m128i oob = _mm_cmpeq_epi8(_mm_max_epu8(ir, _mm_set1_epi8(16)), ir);
     return spu__xs(_mm_shuffle_epi8(spu__xl(a), _mm_or_si128(_mm_xor_si128(ir, _mm_set1_epi8(3)), oob)));
 }
 /* SPU byte index of each host lane: rev32(0..15). */
 SPU__XI __m128i spu__xiota(void) { return _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12); }
-SPU__XI __m128i spu__xshl(int sh) { return _mm_add_epi8(spu__xiota(), _mm_set1_epi8((char)sh)); }   /* bytes left  */
-SPU__XI __m128i spu__xrot(int sh) {                                                                    /* rotate left */
-    return _mm_and_si128(_mm_add_epi8(spu__xiota(), _mm_set1_epi8((char)sh)), _mm_set1_epi8(15));
+SPU__XI u128 spu__xrotq(u128 a, unsigned s) {
+    return spu__xperm(a, _mm_and_si128(_mm_add_epi8(spu__xiota(), _mm_set1_epi8((char)s)), _mm_set1_epi8(15)));
 }
-SPU__XI __m128i spu__xshr(int sh) { return _mm_sub_epi8(spu__xiota(), _mm_set1_epi8((char)sh)); }   /* bytes right */
+SPU__XI u128 spu__xshlq(u128 a, unsigned s) { return spu__xperm(a, _mm_add_epi8(spu__xiota(), _mm_set1_epi8((char)(s & 31)))); }
+SPU__XI u128 spu__xshrq(u128 a, unsigned s) { return spu__xperm(a, _mm_sub_epi8(spu__xiota(), _mm_set1_epi8((char)(s & 31)))); }
+#endif
 SPU__XI __m128i spu__xflip(__m128i x) { return _mm_xor_si128(x, _mm_set1_epi32((int)0x80000000u)); } /* unsigned cmp */
 /* Quadword bit shifts by 0-7 (shlqbi, rotqbi, rotqmbi and immediate forms). Swapping the words
  * inside each 64-bit lane gives lane 0 = SPU bits 127..64 (hi) and lane 1 = bits 63..0 (lo); the
@@ -583,7 +634,7 @@ static inline u128 spu_shlqbyi(u128 a, int sh) {
 }
 #elif SPU_X86
 static inline u128 spu_shlqbyi(u128 a, int sh) {
-    return spu__xperm(a, spu__xshl(sh & 0x1F));
+    return spu__xshlq(a, sh & 0x1F);
 }
 #else
 static inline u128 spu_shlqbyi(u128 a, int sh) { return spu_shlqbyi_ref(a, sh); }
@@ -595,7 +646,7 @@ static inline u128 spu_rotqbyi(u128 a, int sh) {
 }
 #elif SPU_X86
 static inline u128 spu_rotqbyi(u128 a, int sh) {
-    return spu__xperm(a, spu__xrot(sh));
+    return spu__xrotq(a, sh);
 }
 #else
 static inline u128 spu_rotqbyi(u128 a, int sh) { return spu_rotqbyi_ref(a, sh); }
@@ -1736,7 +1787,7 @@ static inline u128 spu_shlqby(u128 a, u128 b) {
 }
 #elif SPU_X86
 static inline u128 spu_shlqby(u128 a, u128 b) {
-    return spu__xperm(a, spu__xshl((int)(b._u32[0] & 0x1F)));
+    return spu__xshlq(a, (int)(b._u32[0] & 0x1F));
 }
 #else
 static inline u128 spu_shlqby(u128 a, u128 b) { return spu_shlqby_ref(a, b); }
@@ -1748,7 +1799,7 @@ static inline u128 spu_rotqby(u128 a, u128 b) {
 }
 #elif SPU_X86
 static inline u128 spu_rotqby(u128 a, u128 b) {
-    return spu__xperm(a, spu__xrot((int)b._u32[0]));
+    return spu__xrotq(a, (int)b._u32[0]);
 }
 #else
 static inline u128 spu_rotqby(u128 a, u128 b) { return spu_rotqby_ref(a, b); }
@@ -1760,7 +1811,7 @@ static inline u128 spu_shlqbybi(u128 a, u128 b) {
 }
 #elif SPU_X86
 static inline u128 spu_shlqbybi(u128 a, u128 b) {
-    return spu__xperm(a, spu__xshl((int)((b._u32[0] >> 3) & 0x1F)));
+    return spu__xshlq(a, (int)((b._u32[0] >> 3) & 0x1F));
 }
 #else
 static inline u128 spu_shlqbybi(u128 a, u128 b) { return spu_shlqbybi_ref(a, b); }
@@ -1772,7 +1823,7 @@ static inline u128 spu_rotqbybi(u128 a, u128 b) {
 }
 #elif SPU_X86
 static inline u128 spu_rotqbybi(u128 a, u128 b) {
-    return spu__xperm(a, spu__xrot((int)(b._u32[0] >> 3)));
+    return spu__xrotq(a, (int)(b._u32[0] >> 3));
 }
 #else
 static inline u128 spu_rotqbybi(u128 a, u128 b) { return spu_rotqbybi_ref(a, b); }
@@ -2234,7 +2285,7 @@ static inline u128 spu_rotqmby(u128 a, u128 b) {
 }
 #elif SPU_X86
 static inline u128 spu_rotqmby(u128 a, u128 b) {
-    return spu__xperm(a, spu__xshr((0 - (int)b._u32[0]) & 0x1F));
+    return spu__xshrq(a, (0 - (int)b._u32[0]) & 0x1F);
 }
 #else
 static inline u128 spu_rotqmby(u128 a, u128 b) { return spu_rotqmby_ref(a, b); }
@@ -2246,7 +2297,7 @@ static inline u128 spu_rotqmbybi(u128 a, u128 b) {
 }
 #elif SPU_X86
 static inline u128 spu_rotqmbybi(u128 a, u128 b) {
-    return spu__xperm(a, spu__xshr((0 - ((int)b._u32[0] >> 3)) & 0x1F));
+    return spu__xshrq(a, (0 - ((int)b._u32[0] >> 3)) & 0x1F);
 }
 #else
 static inline u128 spu_rotqmbybi(u128 a, u128 b) { return spu_rotqmbybi_ref(a, b); }
@@ -2267,7 +2318,7 @@ static inline u128 spu_rotqmbyi(u128 a, int i7) {
 }
 #elif SPU_X86
 static inline u128 spu_rotqmbyi(u128 a, int i7) {
-    return spu__xperm(a, spu__xshr((0 - i7) & 0x1F));
+    return spu__xshrq(a, (0 - i7) & 0x1F);
 }
 #else
 static inline u128 spu_rotqmbyi(u128 a, int i7) { return spu_rotqmbyi_ref(a, i7); }
