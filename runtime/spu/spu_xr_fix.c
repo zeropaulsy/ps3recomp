@@ -1,28 +1,37 @@
 /*
  * The out-of-line exact path of the SPU_FLOAT_RZ x86 float helpers (spu_helpers.h,
- * spu__xr_fixcall), reached through an assembly stub that keeps every register.
+ * spu__xr_chk2/3), reached through an assembly stub that keeps every register.
  *
  * Why a stub: the fast path of fa/fm/fma is a handful of SSE ops plus a range check, and the
  * lanes that fail it (an extended-range operand, an overflow) are rare. With a plain C call on the
  * failing branch, every xmm register is call-clobbered on x86-64, so the compiler kept every live
  * vector in a stack slot around every float op of a lifted function, though the call almost never
- * runs (LBP2's hottest job function: ~500 stack moves for ~95 SPU instructions). The inline asm in
- * spu__xr_fixcall changes only xmm0 and the flags, so the fast path keeps its registers; the stub
+ * runs (LBP2's hottest job function: ~500 stack moves for ~95 SPU instructions). The inline asm of
+ * spu__xr_chk2/3 changes only the result and one GPR, so the fast path keeps its registers; the stub
  * pays for that by saving every vector register (the full ymm registers when the OS has enabled
  * AVX, so their upper halves survive whatever the C code here or libm uses; else the xmm
  * registers) and every caller-saved GPR. Some code takes this path often (FMOD's DSP plugins in
  * LBP2: ~5% of the process with XSAVE/XRSTOR here), so it is plain moves, not XSAVE. MXCSR and
  * the x87 state are not saved: nothing below changes them.
  *
- * Contract (see spu__xr_fixcall): xmm0 = the fast result, xmm1 = the per-lane ok mask, xmm2 = a,
- * xmm3 = b, xmm4 = c (fma only), eax = op; called with rsp 128 below the caller's red zone. Returns
- * the fixed result in xmm0; every other register as it was.
+ * Contract (see spu__xr_chk2/3 in spu_helpers.h): called from cold code with a 96-byte block at
+ * the caller's rsp (below its red zone): r +0 (the fast result), ok +16 (the per-lane ok mask),
+ * a +32, b +48, c +64 (fma only), op +80 (u32). Writes the fixed result to block +0; every
+ * register as it was.
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* dladdr */
+#endif
 #include "spu_helpers.h"
 #include <string.h>
 
 #if SPU__XR_FIXSTUB
 #include <cpuid.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 
 /* 1 when the OS has enabled AVX state (XCR0 bits 1-2): the stub then saves the full ymm
  * registers, else the xmm registers. */
@@ -43,15 +52,15 @@ __attribute__((constructor)) static void spu__xr_fix_init(void)
                   && __builtin_cpu_supports("lzcnt");
 }
 
-/* area: the stub's register image; XMM i is at 32*i (the low half of a 32-byte slot). */
+/* area: the caller's block (see the contract above). */
 static inline __attribute__((always_inline)) void spu__xr_fix_body(unsigned char* area, uint32_t op)
 {
     u128 r, ok, a, b, c;
-    memcpy(&r,  area +   0, 16);
-    memcpy(&ok, area +  32, 16);
-    memcpy(&a,  area +  64, 16);
-    memcpy(&b,  area +  96, 16);
-    memcpy(&c,  area + 128, 16);
+    memcpy(&r,  area +  0, 16);
+    memcpy(&ok, area + 16, 16);
+    memcpy(&a,  area + 32, 16);
+    memcpy(&b,  area + 48, 16);
+    memcpy(&c,  area + 64, 16);
     const uint32_t n1 = (op & SPU__XR_OP_NEG1) ? 0x80000000u : 0;   /* negb (fa) / negc (fma) */
     const uint32_t n2 = (op & SPU__XR_OP_NEG2) ? 0x80000000u : 0;   /* negp (fma) */
     for (int i = 0; i < 4; i++) {
@@ -69,9 +78,80 @@ static __attribute__((noinline)) void spu__xr_fix_base(unsigned char* area, uint
  * lzcnt): the path is hot in some code, see above. */
 static __attribute__((noinline, target("avx2,fma,bmi,bmi2,lzcnt")))
 void spu__xr_fix_v3(unsigned char* area, uint32_t op) { spu__xr_fix_body(area, op); }
-__attribute__((used, visibility("hidden"))) void spu__xr_fix_c(unsigned char* area, uint32_t op)
+/* SPU_XR_FIX_STATS=<seconds> (diagnostic, off by default): count the lanes that take this path
+ * by call site (the lifted code's return address), op and reason, and print the top entries to
+ * stderr every <seconds> s (run.sh ends the process with SIGKILL, so no exit-time report). */
+static int spu__xr_stats_secs;
+static pthread_mutex_t spu__xr_stats_mu = PTHREAD_MUTEX_INITIALIZER;
+typedef struct { uintptr_t ret; uint32_t op, why; uint64_t lanes; uint32_t ex[4]; } spu__xr_stat;
+#define SPU__XR_NSTAT 4096
+static spu__xr_stat spu__xr_stats[SPU__XR_NSTAT];
+static uint64_t spu__xr_stat_calls, spu__xr_stat_lanes;
+static time_t spu__xr_stat_last;
+
+__attribute__((constructor)) static void spu__xr_stats_init(void)
+{
+    const char* e = getenv("SPU_XR_FIX_STATS");
+    if (e && *e) { spu__xr_stats_secs = atoi(e); if (spu__xr_stats_secs <= 0) spu__xr_stats_secs = 10; }
+}
+static int spu__xr_stat_cmp(const void* x, const void* y)
+{
+    const spu__xr_stat *a = x, *b = y;
+    return a->lanes < b->lanes ? 1 : a->lanes > b->lanes ? -1 : 0;
+}
+/* reason bits: operand biased exponent 255 (a 1, b 2, c 4) or 0 (a 8, b 16, c 32); exact result
+ * class in bits 6-7: 0 normal below FLT_MAX, 1 = +-FLT_MAX, 2 = exponent 255, 3 = zero. */
+static void spu__xr_stats_note(const unsigned char* area, uint32_t op, uintptr_t ret)
+{
+    u128 r, ok, a, b, c;
+    memcpy(&r, area, 16); memcpy(&ok, area + 16, 16); memcpy(&a, area + 32, 16);
+    memcpy(&b, area + 48, 16); memcpy(&c, area + 64, 16);
+    pthread_mutex_lock(&spu__xr_stats_mu);
+    spu__xr_stat_calls++;
+    for (int i = 0; i < 4; i++) {
+        if (ok._u32[i] >> 31) continue;
+        const uint32_t ea = a._u32[i] >> 23 & 0xFF, eb = b._u32[i] >> 23 & 0xFF, ec = c._u32[i] >> 23 & 0xFF;
+        const int fma = (op & SPU__XR_OP_KIND) == SPU__XR_OP_FMA;
+        uint32_t why = (ea == 255) | (eb == 255) << 1 | (fma && ec == 255) << 2
+                     | (ea == 0) << 3 | (eb == 0) << 4 | (fma && ec == 0) << 5;
+        const uint32_t rm = r._u32[i] & 0x7FFFFFFFu;
+        why |= (rm == 0 ? 3u : rm == 0x7F7FFFFFu ? 1u : (rm >> 23) == 255 ? 2u : 0u) << 6;
+        spu__xr_stat_lanes++;
+        uint32_t h = (uint32_t)((ret * 0x9E3779B97F4A7C15ull) >> 40) ^ op * 31 ^ why * 977;
+        for (int k = 0; k < SPU__XR_NSTAT; k++, h++) {
+            spu__xr_stat* s = &spu__xr_stats[h % SPU__XR_NSTAT];
+            if (!s->lanes) { s->ret = ret; s->op = op; s->why = why;
+                             s->ex[0] = a._u32[i]; s->ex[1] = b._u32[i]; s->ex[2] = c._u32[i]; s->ex[3] = r._u32[i]; }
+            if (s->ret == ret && s->op == op && s->why == why) { s->lanes++; break; }
+        }
+    }
+    const time_t now = time(NULL);
+    if (!spu__xr_stat_last) spu__xr_stat_last = now;
+    if (now - spu__xr_stat_last >= spu__xr_stats_secs) {
+        spu__xr_stat_last = now;
+        static spu__xr_stat tmp[SPU__XR_NSTAT];
+        int n = 0;
+        for (int k = 0; k < SPU__XR_NSTAT; k++) if (spu__xr_stats[k].lanes) tmp[n++] = spu__xr_stats[k];
+        qsort(tmp, (size_t)n, sizeof tmp[0], spu__xr_stat_cmp);
+        Dl_info di; uintptr_t base = 0;
+        if (dladdr((void*)spu__xr_stats_note, &di) && di.dli_fbase) base = (uintptr_t)di.dli_fbase;
+        fprintf(stderr, "[xr-fix] t=%ld calls=%llu lanes=%llu sites=%d\n", (long)now,
+                (unsigned long long)spu__xr_stat_calls, (unsigned long long)spu__xr_stat_lanes, n);
+        static const char* kind[] = { "fa", "fm", "fma", "?" };
+        for (int k = 0; k < n && k < 40; k++)
+            fprintf(stderr, "[xr-fix]   %10llu  ret=+0x%lx %s%s%s why=0x%02x  ex a=%08x b=%08x c=%08x r=%08x\n",
+                    (unsigned long long)tmp[k].lanes, (unsigned long)(tmp[k].ret - base),
+                    kind[tmp[k].op & 3], tmp[k].op & SPU__XR_OP_NEG1 ? " n1" : "", tmp[k].op & SPU__XR_OP_NEG2 ? " n2" : "",
+                    tmp[k].why, tmp[k].ex[0], tmp[k].ex[1], tmp[k].ex[2], tmp[k].ex[3]);
+        fflush(stderr);
+    }
+    pthread_mutex_unlock(&spu__xr_stats_mu);
+}
+
+__attribute__((used, visibility("hidden"))) void spu__xr_fix_c(unsigned char* area, uint32_t op, uintptr_t ret)
 {
     if (spu__xr_use_v3) spu__xr_fix_v3(area, op); else spu__xr_fix_base(area, op);
+    if (__builtin_expect(spu__xr_stats_secs != 0, 0)) spu__xr_stats_note(area, op, ret);
 }
 
 __asm__(
@@ -94,7 +174,6 @@ __asm__(
     "\tpushq %r8\n\tpushq %r9\n\tpushq %r10\n\tpushq %r11\n"
     "\tsubq $512, %rsp\n"
     "\tandq $-32, %rsp\n"
-    "\tmovl %eax, %esi\n"
     "\tcmpb $0, spu__xr_ymm_ok(%rip)\n"
     "\tje 1f\n"
     "\tvmovdqu %ymm0, 0(%rsp)\n"
@@ -134,11 +213,13 @@ __asm__(
     "\tmovdqu %xmm14, 448(%rsp)\n"
     "\tmovdqu %xmm15, 480(%rsp)\n"
     "2:\n"
-    "\tmovq %rsp, %rdi\n"
+    "\tleaq 16(%rbp), %rdi\n"              /* the block */
+    "\tmovl 80(%rdi), %esi\n"              /* op */
+    "\tmovq 8(%rbp), %rdx\n"               /* the return address in the lifted code (stats only) */
     "\tcall spu__xr_fix_c\n"
     "\tcmpb $0, spu__xr_ymm_ok(%rip)\n"
     "\tje 3f\n"
-    "\tvmovdqu 0(%rsp), %xmm0\n"          /* the result: 16 bytes, as written (store forwarding); the asm owns ymm0 */
+    "\tvmovdqu 0(%rsp), %ymm0\n"
     "\tvmovdqu 32(%rsp), %ymm1\n"
     "\tvmovdqu 64(%rsp), %ymm2\n"
     "\tvmovdqu 96(%rsp), %ymm3\n"
