@@ -646,6 +646,70 @@ static SPU_NOINLINE_COLD void mfc_diag_get_done(spu_context* spu, uint32_t lsa, 
     (void)spu; (void)lsa; (void)ea; (void)size; (void)cmd;
 }
 
+/* The copy half of a plain PUT (see mfc_do_transfer): lines another SPU holds a reservation on
+ * are copied and notified under the lock-line lock, the rest lock-free. Shared with the lean
+ * MFC command path in spu_channels.c. */
+static inline void mfc_put_copy(spu_context* spu, uint32_t ea32, uint8_t* ls_ptr, uint8_t* ea_ptr,
+                                uint32_t size)
+{
+    extern void spu_coh_notify_write(uint32_t);
+    extern void spu_coh_notify_write_except(uint32_t, const void*);
+    extern void spu_lockline_lock(void);
+    extern void spu_lockline_unlock(void);
+    uint32_t a0 = ea32 & ~127u;
+    uint32_t a1 = (ea32 + size - 1u) & ~127u;
+    int span_reserved = 0;
+    for (uint32_t a = a0; ; a += 128u) {
+        if (spu_coh_line_reserved(a)) { span_reserved = 1; break; }
+        if (a == a1) break;
+    }
+    /* Lines the unlocked pass left for the locked one: a 16 KiB
+     * transfer spans at most 129 lines. */
+    uint64_t locked_lines[3] = {0, 0, 0};
+    if (span_reserved && a0 != a1 && ((a1 - a0) >> 7) < 64u * 3u) {
+        uint32_t i = 0;
+        for (uint32_t a = a0; ; a += 128u, i++) {
+            const uint32_t lo = a > ea32 ? a - ea32 : 0u;
+            const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
+            if (spu_coh_line_reserved(a)) locked_lines[i >> 6] |= 1ull << (i & 63u);
+            else memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
+            if (a == a1) break;
+        }
+        spu_lockline_lock();
+        i = 0;
+        for (uint32_t a = a0; ; a += 128u, i++) {
+            const uint32_t lo = a > ea32 ? a - ea32 : 0u;
+            const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
+            if ((locked_lines[i >> 6] >> (i & 63u)) & 1u) {
+                memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
+                spu_coh_notify_write_except(a, spu);
+            } else if (spu_coh_line_reserved(a)) {
+                spu_coh_notify_write_except(a, spu);   /* reserved after its copy */
+            }
+            if (a == a1) break;
+        }
+        spu_lockline_unlock();
+    } else if (span_reserved) {
+        spu_lockline_lock();
+        memcpy(ea_ptr, ls_ptr, size);
+        for (uint32_t a = a0; ; a += 128u) {
+            if (spu_coh_line_reserved(a)) spu_coh_notify_write_except(a, spu);
+            if (a == a1) break;
+        }
+        spu_lockline_unlock();
+    } else {
+        memcpy(ea_ptr, ls_ptr, size);
+        for (uint32_t a = a0; ; a += 128u) {
+            if (spu_coh_line_reserved(a)) {
+                spu_lockline_lock();
+                spu_coh_notify_write_except(a, spu);
+                spu_lockline_unlock();
+            }
+            if (a == a1) break;
+        }
+    }
+}
+
 /*
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
@@ -869,65 +933,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * snapshot may be torn, so it gets its event and loses its reservation
          * rather than committing against a line it never saw whole. */
         {
-            extern void spu_coh_notify_write(uint32_t);
-            extern void spu_coh_notify_write_except(uint32_t, const void*);
-            extern void spu_lockline_lock(void);
-            extern void spu_lockline_unlock(void);
             extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
             spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
-            uint32_t a0 = (uint32_t)ea & ~127u;
-            uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
-            int span_reserved = 0;
-            for (uint32_t a = a0; ; a += 128u) {
-                if (spu_coh_line_reserved(a)) { span_reserved = 1; break; }
-                if (a == a1) break;
-            }
-            /* Lines the unlocked pass left for the locked one: a 16 KiB
-             * transfer spans at most 129 lines. */
-            uint64_t locked_lines[3] = {0, 0, 0};
-            if (span_reserved && a0 != a1 && ((a1 - a0) >> 7) < 64u * 3u) {
-                const uint32_t ea32 = (uint32_t)ea;
-                uint32_t i = 0;
-                for (uint32_t a = a0; ; a += 128u, i++) {
-                    const uint32_t lo = a > ea32 ? a - ea32 : 0u;
-                    const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
-                    if (spu_coh_line_reserved(a)) locked_lines[i >> 6] |= 1ull << (i & 63u);
-                    else memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
-                    if (a == a1) break;
-                }
-                spu_lockline_lock();
-                i = 0;
-                for (uint32_t a = a0; ; a += 128u, i++) {
-                    const uint32_t lo = a > ea32 ? a - ea32 : 0u;
-                    const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
-                    if ((locked_lines[i >> 6] >> (i & 63u)) & 1u) {
-                        memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
-                        spu_coh_notify_write_except(a, spu);
-                    } else if (spu_coh_line_reserved(a)) {
-                        spu_coh_notify_write_except(a, spu);   /* reserved after its copy */
-                    }
-                    if (a == a1) break;
-                }
-                spu_lockline_unlock();
-            } else if (span_reserved) {
-                spu_lockline_lock();
-                memcpy(ea_ptr, ls_ptr, size);
-                for (uint32_t a = a0; ; a += 128u) {
-                    if (spu_coh_line_reserved(a)) spu_coh_notify_write_except(a, spu);
-                    if (a == a1) break;
-                }
-                spu_lockline_unlock();
-            } else {
-                memcpy(ea_ptr, ls_ptr, size);
-                for (uint32_t a = a0; ; a += 128u) {
-                    if (spu_coh_line_reserved(a)) {
-                        spu_lockline_lock();
-                        spu_coh_notify_write_except(a, spu);
-                        spu_lockline_unlock();
-                    }
-                    if (a == a1) break;
-                }
-            }
+            mfc_put_copy(spu, (uint32_t)ea, ls_ptr, ea_ptr, size);
         }
         /* Tell whoever is listening where this PUT landed.
          *
@@ -1199,6 +1207,19 @@ static inline void spu_dma_repeat_log_end(const spu_context* spu, uint32_t ea, u
         fputc(10, stderr);
     }
 }
+
+/* mfc_submit's repeated-transfer watchdog (below), at file scope so that the lean MFC command
+ * path in spu_channels.c (spu_wrch_mfc_cmd) keeps the same per-thread count. s_mfc_rep_limit is 0
+ * and s_mfc_rep_log -1 until the first command through mfc_submit reads the environment. One
+ * thread-local object: every Darwin TLV access is a call, and this runs on every MFC command. */
+struct mfc_rep_state { uint32_t last_ea, last_lsa, rep; unsigned long long since; };
+static SPU_THREAD_LOCAL struct mfc_rep_state t_mfc_rep;
+static uint32_t s_mfc_rep_limit = 0;
+static unsigned long long s_mfc_rep_secs, s_mfc_rep_backoff_ms;
+static int64_t s_mfc_rep_log = -1;
+/* Lines of the policy-module transfer trace printed so far (mfc_submit; the lean path defers
+ * to it while the trace is open). */
+static int s_mfc_pm_trace_n = 0;
 
 static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
@@ -1520,14 +1541,15 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * count-only rule halted a healthy job and wedged the frame. Halt only once
      * the repeats have also lasted SPU_DMA_REPEAT_SECS (default 30) of wall
      * time. Below that, back off 1 ms per repeat rather than spinning. */
-    /* One thread-local object: every Darwin TLV access is a call, and this
-     * runs on every MFC command. */
-    { static SPU_THREAD_LOCAL struct { uint32_t last_ea, last_lsa, rep; unsigned long long since; } t_rep;
-#define s_last_ea  t_rep.last_ea
-#define s_last_lsa t_rep.last_lsa
-#define s_rep      t_rep.rep
-#define s_since    t_rep.since
-      static uint32_t s_limit = 0; static unsigned long long s_secs, s_backoff_ms;
+    { struct mfc_rep_state* const t = &t_mfc_rep;
+#define s_last_ea  t->last_ea
+#define s_last_lsa t->last_lsa
+#define s_rep      t->rep
+#define s_since    t->since
+#define s_limit      s_mfc_rep_limit
+#define s_secs       s_mfc_rep_secs
+#define s_backoff_ms s_mfc_rep_backoff_ms
+#define s_log        s_mfc_rep_log
       extern unsigned long long ps3_ms_now(void);
       if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
                       s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u;
@@ -1540,7 +1562,6 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
        * per-image total every 4096 episodes. Says what a job is polling and
        * how long it waits -- the watchdog's back-off is on the critical path
        * only when such episodes are. Unset: no cost beyond the existing test. */
-      static int64_t s_log = -1;
       if (s_log < 0) { const char* e = getenv("SPU_DMA_REPEAT_LOG"); s_log = e ? atoll(e) : 0; }
       if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
           if (++s_rep >= s_limit) {
@@ -1593,6 +1614,10 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 #undef s_last_lsa
 #undef s_rep
 #undef s_since
+#undef s_limit
+#undef s_secs
+#undef s_backoff_ms
+#undef s_log
     }
 
     /* Mark tag as in-progress */
@@ -1762,7 +1787,6 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * always on (policy runs are rare and their DMA pattern is the primary
      * bring-up signal: joblist fetch, job-module loads, output stores). */
     if (spu->policy_mode) {
-        static int _pn = 0;
         /* Cap the boot-time flood, but reopen the trace once the PPU is at the
          * job barrier (g_barrier_sync_watch armed): the post-ticket DMA
          * sequence is exactly what the pipeline diagnosis needs. */
@@ -1772,15 +1796,15 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * nothing here can print again unless the barrier watch is armed, so
          * stop advancing the counter: every policy-module DMA on every SPU
          * thread was writing this one shared word. */
-        if (_pn <= 96 || g_barrier_sync_watch) {
-            int open = (_pn < 96) || (g_barrier_sync_watch && _post < 256);
+        if (s_mfc_pm_trace_n <= 96 || g_barrier_sync_watch) {
+            int open = (s_mfc_pm_trace_n < 96) || (g_barrier_sync_watch && _post < 256);
             if (open) {
-                if (_pn >= 96) _post++;
+                if (s_mfc_pm_trace_n >= 96) _post++;
                 fprintf(stderr, "[spurs-pm] DMA cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
                         cmd, lsa, (unsigned long long)ea, size, tag);
-            } else if (_pn == 96)
+            } else if (s_mfc_pm_trace_n == 96)
                 fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
-            _pn++;
+            s_mfc_pm_trace_n++;
         }
     }
 

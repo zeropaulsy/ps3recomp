@@ -1107,9 +1107,12 @@ void spu_direct_init(void);
  * no longer counts those writes. Off by default, as the tests define their own spu_wrch. The
  * generated headers' `void spu_wrch(...)` declaration then names the static inline below,
  * which C and C++ allow (the earlier static declaration gives the linkage); the real function
- * is reached through an asm label (ELF: no symbol prefix). */
+ * is reached through an asm label (ELF: no symbol prefix). MFC_Cmd and MFC_WrTagUpdate go to
+ * the lean DMA path in spu_channels.c (spu_wrch_mfc_cmd), which falls back to spu_wrch. */
 #if defined(SPU_WRCH_INLINE) && defined(__ELF__) && (defined(__GNUC__) || defined(__clang__))
 void spu_wrch_extern(spu_context* ctx, uint32_t channel, u128 value) __asm__("spu_wrch");
+void spu_wrch_mfc_cmd(spu_context* ctx, uint32_t cmd);              /* spu_channels.c: lean DMA */
+void spu_wrch_mfc_tag_update(spu_context* ctx, uint32_t v);
 static inline __attribute__((always_inline)) void spu_wrch_inline(spu_context* ctx, uint32_t channel,
                                                                   u128 value)
 {
@@ -1121,6 +1124,8 @@ static inline __attribute__((always_inline)) void spu_wrch_inline(spu_context* c
     case MFC_Size:      ctx->mfc_size = v;        return;
     case MFC_TagID:     ctx->mfc_tag = v & 0x1F;  return;
     case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
+    case MFC_Cmd:       spu_wrch_mfc_cmd(ctx, v); return;
+    case MFC_WrTagUpdate: spu_wrch_mfc_tag_update(ctx, v); return;
     default:            spu_wrch_extern(ctx, channel, value); return;
     }
 }

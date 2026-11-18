@@ -1031,6 +1031,139 @@ static int channel_is_mfc(uint32_t ch)
 }
 
 /* ===========================================================================
+ * Lean MFC command path (the lifted code's spu_wrch, SPU_WRCH_INLINE)
+ *
+ * Every DMA a job issues went spu_wrch -> mfc_submit -> mfc_do_transfer ->
+ * spu_overlay_note_get: four calls with large frames and stack canaries, and
+ * some twenty diagnostics each reading its own lazily-initialised environment
+ * flag. In LittleBigPlanet 2's SPURS job lane that flat overhead was a third
+ * of all runtime time (spu_wrch, mfc_do_transfer and spu_overlay_note_get
+ * ~13% of the lane). spu_wrch_mfc_cmd does the common case directly -- a plain
+ * GET or PUT (with or without fence/barrier), well formed, into committed
+ * memory, from an image none of the image-specific hooks watch -- and hands
+ * anything else to spu_wrch unchanged, before it has changed any state. It is
+ * off whenever one of the diagnostics it skips is switched on, and with
+ * SPU_MFC_LEAN=0.
+ * ===========================================================================*/
+void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
+void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size);
+extern uint32_t g_barrier_sync_watch;
+extern uint8_t g_vm_page_bitmap[65536 / 8];
+
+static int s_mfc_lean = -1;   /* -1 until the first command reads the environment */
+static SPU_NOINLINE_COLD int spu_mfc_lean_settle(void)
+{
+    /* Every variable that switches on a diagnostic of spu_wrch's MFC_Cmd /
+     * MFC_WrTagUpdate path, mfc_submit, mfc_do_transfer or the PUT lock guard.
+     * (mfc_do_transfer's own set is behind mfc_diag_on; the repeat watchdog's
+     * variables are honoured by the lean path itself.) */
+    static const char* const vars[] = {
+        "SPU_CHHIST", "SPU_CMDHIST", "SPU_CMDDUMP", "SPU_DMATRACE", "SPU_DMATRACE_ALL",
+        "SPU_DMATRACE_RAW", "SPU_H2LSRC", "SPU_PUTEA", "SPU_PUTHIST", "SPU_ROWCOV", "SPU_VRAMPC",
+        "SPU_WATCHEA", "SPU_WATCHLSA", "YDKJ_CRI_CHAIN", "SPU_DMA_LAX", "SPU_DSP_IMAGE_EA",
+        "LBP_SKIP_NULL_DMA", "SPU_POISON_DMA_WATCH", "SPU_LOCKGUARD", "SPU_TAGPROBE" };
+    int on = 1;
+    const char* e = getenv("SPU_MFC_LEAN");
+    if (e && atoi(e) == 0) on = 0;
+    for (size_t i = 0; i < sizeof vars / sizeof vars[0]; i++)
+        if (getenv(vars[i])) on = 0;
+    if (mfc_diag_on()) on = 0;
+#ifdef SPU_DMA_LOG
+    on = 0;
+#endif
+    s_mfc_lean = on;
+    return on;
+}
+static inline int spu_mfc_lean_on(void)
+{
+    const int on = s_mfc_lean;
+    return __builtin_expect(on > 0, 1) || (on < 0 && spu_mfc_lean_settle());
+}
+
+static SPU_NOINLINE_COLD void spu_wrch_mfc_slow(spu_context* ctx, uint32_t channel, uint32_t v)
+{
+    u128 value;
+    memset(&value, 0, sizeof value);
+    value._u32[0] = v;
+    spu_wrch(ctx, channel, value);
+}
+
+void spu_wrch_mfc_cmd(spu_context* ctx, uint32_t cmd)
+{
+    if (!spu_mfc_lean_on()) goto slow;
+    switch (cmd) {
+    case 0x20: case 0x21: case 0x22:   /* PUT, PUTB, PUTF */
+    case 0x40: case 0x41: case 0x42:   /* GET, GETB, GETF */
+        break;
+    default: goto slow;                /* lists, atomics, syncs, class IDs, ... */
+    }
+    {
+        const uint32_t lsa = ctx->mfc_lsa, ea = ctx->mfc_eal, size = ctx->mfc_size;
+        const uint32_t bit = 1u << (ctx->mfc_tag & 31u);
+        const int is_put = !(cmd & 0x40);
+        /* mfc_do_transfer's validity rules, and its null-page rule for both
+         * directions (low GETs have their own opt-in hooks). A stalled list in
+         * the same tag group keeps the group incomplete: mfc_submit's case. */
+        if (ctx->mfc_eah | (ctx->list_stall_mask & bit)) goto slow;
+        if (size - 1u >= MFC_MAX_DMA_SIZE || (size >= 16 && (size & 15)) ||
+            ((lsa ^ ea) & 15) || ea < 0x10000u) goto slow;
+        const uint32_t lsm = lsa & SPU_LS_MASK;
+        if (lsm + size > SPU_LS_SIZE || (uint64_t)ea + size > 0x100000000ull) goto slow;
+        /* Image- and address-specific hooks of mfc_submit / mfc_do_transfer. */
+        if (ctx->image_id == 22 || (ctx->image_id == 2 && lsa == 0xC00u) ||
+            (lsa == 0xA00u && ea == 0x30023680u)) goto slow;
+        if (g_barrier_sync_watch || (ctx->policy_mode && s_mfc_pm_trace_n <= 96)) goto slow;
+        if (is_put && ea < 0x40005000u && ea + size > 0x40003000u) goto slow;   /* POISON-DMA region */
+        /* Committed memory: mfc_ea_range_committed's inline test; a miss takes
+         * the slow path, which commits on demand. */
+        if (!vm_base) goto slow;
+        { const uint32_t p0 = ea >> 16, p1 = (ea + size - 1) >> 16;
+          if (!((g_vm_page_bitmap[p0 >> 3] >> (p0 & 7)) & (g_vm_page_bitmap[p1 >> 3] >> (p1 & 7)) & 1))
+              goto slow; }
+        /* mfc_submit's repeated-transfer watchdog: count here, but leave a
+         * repeat that reaches the limit (back-off / halt) and a logged episode's
+         * end to it. Nothing above changed any state. */
+        { struct mfc_rep_state* const t = &t_mfc_rep;
+          const uint32_t limit = s_mfc_rep_limit;
+          if (!limit) goto slow;                    /* not read from the environment yet */
+          if (ea == t->last_ea && lsa == t->last_lsa) {
+              if (t->rep + 1u >= limit) goto slow;
+              t->rep++;
+          } else {
+              if (s_mfc_rep_log && t->rep >= limit) goto slow;
+              t->last_ea = ea; t->last_lsa = lsa; t->rep = 0; t->since = 0;
+          } }
+
+        mfc_engine* const mfc = mfc_for(ctx);
+        mfc->tag_completed &= ~bit;
+        uint8_t* const ls_ptr = &ctx->ls[lsm];
+        uint8_t* const ea_ptr = vm_base + ea;
+        if (!is_put) {
+            memcpy(ls_ptr, ea_ptr, size);
+            spu_overlay_note_get(ctx, ea, ls_ptr, size);
+        } else {
+            mfc_put_copy(ctx, ea, ls_ptr, ea_ptr, size);
+            if (g_spu_put_hook) g_spu_put_hook(ea, size);
+        }
+        mfc->tag_completed |= bit;
+        return;
+    }
+slow:
+    spu_wrch_mfc_slow(ctx, MFC_Cmd, cmd);
+}
+
+/* MFC_WrTagUpdate: DMA is synchronous, so the status is the completed tags of
+ * the mask now. An update that would raise the tag-status event takes spu_wrch. */
+void spu_wrch_mfc_tag_update(spu_context* ctx, uint32_t v)
+{
+    if (!spu_mfc_lean_on() || (v != 0 && (ctx->event_mask & 0x1u))) {
+        spu_wrch_mfc_slow(ctx, MFC_WrTagUpdate, v);
+        return;
+    }
+    ctx->mfc_tag_status = mfc_tag_wait(mfc_for(ctx), ctx->mfc_tag_mask, v);
+}
+
+/* ===========================================================================
  * Channel write
  * ===========================================================================*/
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
@@ -2338,10 +2471,15 @@ static SPU_NOINLINE_COLD void spu_ovl_reslog(const spu_context* ctx, const char*
                 ctx->image_id, what, img, base, ea, lsa, size, (unsigned)(ctx->pc & SPU_LS_MASK));
 }
 
-void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
+/* The two GET diagnostics of spu_overlay_note_get (SPU_DUMP_OVL, SPU_OVL_PROBE), out of line:
+ * -1 until the first GET reads both variables, then nonzero only if one is set. The hot function
+ * then has no environment state of its own (and no stack canary: the probe's strtoul end pointer
+ * was address-taken). */
+static int s_ovl_note_diag = -1;
+static SPU_NOINLINE_COLD void spu_ovl_note_diag(spu_context* ctx, uint32_t ea, uint32_t lsa,
+                                                const uint8_t* ls, uint32_t size)
 {
-    uint32_t lsa = (uint32_t)(ls - ctx->ls);
-    if (__builtin_expect(s_ovl_dump_on != 0, 0)) spu_ovl_dump(ctx, ea, lsa, ls, size);
+    if (s_ovl_dump_on != 0) spu_ovl_dump(ctx, ea, lsa, ls, size);   /* settles s_ovl_dump_on */
     /* SPU_OVL_PROBE=<lsa>[,<n>]: log the first n (default 2000) GETs that write LS <lsa>, with
      * the 16 bytes they put there (which body is streamed to that address, and from where). */
     { static int s_pn = -1; static uint32_t s_pl; static int s_pc;
@@ -2355,7 +2493,14 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
           fprintf(stderr, " head");
           for (int k = 0; k < 16; k += 4) fprintf(stderr, " %02X%02X%02X%02X", ls[k], ls[k+1], ls[k+2], ls[k+3]);
           fprintf(stderr, "\n");
-      } }
+      }
+      s_ovl_note_diag = s_ovl_dump_on || s_pn; }
+}
+
+void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
+{
+    uint32_t lsa = (uint32_t)(ls - ctx->ls);
+    if (__builtin_expect(s_ovl_note_diag != 0, 0)) spu_ovl_note_diag(ctx, ea, lsa, ls, size);
     for (unsigned slot = 0; slot < 4; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
