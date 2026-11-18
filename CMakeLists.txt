@@ -439,7 +439,8 @@ if(PS3RECOMP_BUILD_TESTS)
     if(NOT WIN32)
         # The vector single-precision ops against the exact per-lane references.
         add_executable(test_spu_float_exact
-            runtime/spu/tests/test_spu_float_exact.c)
+            runtime/spu/tests/test_spu_float_exact.c
+            runtime/spu/spu_xr_fix.c)
         target_include_directories(test_spu_float_exact PRIVATE include runtime/spu)
         target_compile_options(test_spu_float_exact PRIVATE -UNDEBUG)
         target_link_libraries(test_spu_float_exact PRIVATE m)
@@ -447,7 +448,8 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(spu_float_exact PROPERTIES TIMEOUT 300)
         # The vector forms against the scalar per-lane forms, directly.
         add_executable(test_spu_float_vector_scalar
-            runtime/spu/tests/test_spu_float_vector_scalar.c)
+            runtime/spu/tests/test_spu_float_vector_scalar.c
+            runtime/spu/spu_xr_fix.c)
         target_include_directories(test_spu_float_vector_scalar PRIVATE include runtime/spu)
         target_compile_options(test_spu_float_vector_scalar PRIVATE -UNDEBUG)
         target_link_libraries(test_spu_float_vector_scalar PRIVATE m)
@@ -461,7 +463,8 @@ if(PS3RECOMP_BUILD_TESTS)
             # SPU_FLOAT_RZ on x86: every float helper gives the same bits with MXCSR at round
             # toward zero + FZ + DAZ as with the default MXCSR.
             add_executable(test_spu_float_mode_x86
-                runtime/spu/tests/test_spu_float_mode_x86.c)
+                runtime/spu/tests/test_spu_float_mode_x86.c
+                runtime/spu/spu_xr_fix.c)
             target_include_directories(test_spu_float_mode_x86 PRIVATE include runtime/spu)
             target_compile_options(test_spu_float_mode_x86 PRIVATE -UNDEBUG -msse4.1 -ffp-contract=off)
             target_link_libraries(test_spu_float_mode_x86 PRIVATE m)

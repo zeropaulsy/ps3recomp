@@ -256,6 +256,9 @@ static int spu_float_rz_wanted(void)
     }
     return on;
 }
+/* Defined (weak) by lifted code built with SPU_XR_ASSUME_RZ (spu_helpers.h): that code is only
+ * correct in round toward zero + FZ + DAZ, so the mode is then on for every run. */
+extern const unsigned char spu_xr_assume_rz_built __attribute__((weak));
 static uint64_t spu_float_mode_enter(void)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
@@ -266,7 +269,7 @@ static uint64_t spu_float_mode_enter(void)
     __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)SPU_FPCR_RZFZ));
     return v;
 #elif (defined(__x86_64__) || defined(__i386__)) && defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS)
-    if (!spu_float_rz_wanted()) return ~0ull;
+    if (!spu_float_rz_wanted() && !&spu_xr_assume_rz_built) return ~0ull;
     const unsigned v = _mm_getcsr();
     if ((v & 0xFFC0u) == SPU_MXCSR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
     _mm_setcsr(SPU_MXCSR_RZFZ | (v & 0x3Fu));            /* keep the sticky exception flags */
