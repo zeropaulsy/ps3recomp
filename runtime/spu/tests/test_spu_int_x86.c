@@ -75,12 +75,28 @@ int main(void) {
         TI(spu_ahi); TI(spu_sfhi); TI(spu_mpyi); TI(spu_mpyui);
         TI(spu_rothi); TI(spu_roti); TI(spu_rotmahi); TI(spu_rotmai);
         T3(spu_mpya); T3(spu_mpyhha); T3(spu_mpyhhau); T3(spu_addx); T3(spu_sfx);
-        T1(spu_cntb); T1(spu_xsbh); T1(spu_xshw);
+        T1(spu_cntb); T1(spu_xsbh); T1(spu_xshw); T1(spu_clz);
+        { u128 t = a; t._u32[1] = 1u << (rnd() & 31); t._u32[2] = t._u32[2] >> (rnd() & 31);   /* every clz */
+          cmp("spu_clz", spu_clz(t), spu_clz_ref(t), t, z, z, 0); }
         const int pos = (int)rnd();
         cmp("cbd_pos", spu_cbd_pos(pos), ref_cbd_pos(pos), z, z, z, pos);
         cmp("chd_pos", spu_chd_pos(pos), ref_chd_pos(pos), z, z, z, pos);
         cmp("cwd_pos", spu_cwd_pos(pos), ref_cwd_pos(pos), z, z, z, pos);
         cmp("cdd_pos", spu_cdd_pos(pos), ref_cdd_pos(pos), z, z, z, pos);
+        /* the x86 table forms of the generate-controls, d (register + immediate) and x (two registers) */
+        cmp("cbd", spu_cbd(a, imm), ref_cbd_pos((int)(a._u32[0] + (uint32_t)imm)), a, z, z, imm);
+        cmp("chd", spu_chd(a, imm), ref_chd_pos((int)(a._u32[0] + (uint32_t)imm)), a, z, z, imm);
+        cmp("cwd", spu_cwd(a, imm), ref_cwd_pos((int)(a._u32[0] + (uint32_t)imm)), a, z, z, imm);
+        cmp("cdd", spu_cdd(a, imm), ref_cdd_pos((int)(a._u32[0] + (uint32_t)imm)), a, z, z, imm);
+        cmp("cbx", spu_cbx(a, b), ref_cbd_pos((int)(a._u32[0] + b._u32[0])), a, b, z, 0);
+        cmp("chx", spu_chx(a, b), ref_chd_pos((int)(a._u32[0] + b._u32[0])), a, b, z, 0);
+        cmp("cwx", spu_cwx(a, b), ref_cwd_pos((int)(a._u32[0] + b._u32[0])), a, b, z, 0);
+        cmp("cdx", spu_cdx(a, b), ref_cdd_pos((int)(a._u32[0] + b._u32[0])), a, b, z, 0);
+    }
+    for (int p = 0; p < 16; p++) {   /* every position once, whatever the random draw covered */
+        const u128 pa = spu_il(p);
+        cmp("cbd16", spu_cbd(pa, 0), ref_cbd_pos(p), pa, z, z, p); cmp("chd16", spu_chd(pa, 0), ref_chd_pos(p), pa, z, z, p);
+        cmp("cwd16", spu_cwd(pa, 0), ref_cwd_pos(p), pa, z, z, p); cmp("cdd16", spu_cdd(pa, 0), ref_cdd_pos(p), pa, z, z, p);
     }
     printf(s_fail ? "%d FAILURES\n" : "all x86 SPU helpers match their references\n", s_fail);
     return s_fail != 0;

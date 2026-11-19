@@ -1515,14 +1515,36 @@ static inline __m128i spu__sse_key(__m128i x) {
     const __m128i neg = _mm_srai_epi32(x, 31);
     return _mm_sub_epi32(_mm_xor_si128(spu__sse_mag(x), neg), neg);
 }
-#define SPU__SSE_CMP(name, cmp, key) static inline u128 name(u128 a, u128 b) { \
+#if defined(SPU_MXCSR_RZFZ)
+/* In SPU_MXCSR_RZFZ (spu__xr_on(); always, in lifted code built with SPU_XR_ASSUME_RZ) the host's
+ * own float compare gives the SPU answer for every lane that is not a NaN on the host: DAZ reads a
+ * biased-exponent-0 operand as a zero (any two SPU zeros are equal), and the remaining values,
+ * +-Inf included (exponent 255, fraction 0: the largest SPU magnitudes), order like the SPU's
+ * sign-magnitude keys. Exponent 255 with a nonzero fraction is unordered on the host and ordinary
+ * extended range on the SPU: when any lane holds one, the integer keys decide (cmpps + cmpunordps
+ * + movmskps instead of ~15 integer ops; test_spu_float_mode_x86 checks both modes agree). */
+#define SPU__RZ_ID(x)  (x)
+#define SPU__RZ_ABS(x) _mm_andnot_ps(_mm_set1_ps(-0.0f), (x))
+#define SPU__SSE_CMP(name, cmp, key, fcmp, fval) static inline u128 name(u128 a, u128 b) { \
+    __m128i A, B, r; memcpy(&A, &a, 16); memcpy(&B, &b, 16); \
+    const __m128 FA = fval(_mm_castsi128_ps(A)), FB = fval(_mm_castsi128_ps(B)); \
+    if (spu__xr_on() && __builtin_expect(_mm_movemask_ps(_mm_cmpunord_ps(FA, FB)) == 0, 1)) \
+        r = _mm_castps_si128(fcmp(FA, FB)); \
+    else \
+        r = cmp(key(A), key(B)); \
+    u128 out; memcpy(&out, &r, 16); return out; }
+#else
+#define SPU__SSE_CMP(name, cmp, key, fcmp, fval) static inline u128 name(u128 a, u128 b) { \
     __m128i A, B; memcpy(&A, &a, 16); memcpy(&B, &b, 16); \
     const __m128i r = cmp(key(A), key(B)); u128 out; memcpy(&out, &r, 16); return out; }
-SPU__SSE_CMP(spu_fceq,  _mm_cmpeq_epi32, spu__sse_key)
-SPU__SSE_CMP(spu_fcgt,  _mm_cmpgt_epi32, spu__sse_key)
-SPU__SSE_CMP(spu_fcmeq, _mm_cmpeq_epi32, spu__sse_mag)
-SPU__SSE_CMP(spu_fcmgt, _mm_cmpgt_epi32, spu__sse_mag)
+#endif
+SPU__SSE_CMP(spu_fceq,  _mm_cmpeq_epi32, spu__sse_key, _mm_cmpeq_ps, SPU__RZ_ID)
+SPU__SSE_CMP(spu_fcgt,  _mm_cmpgt_epi32, spu__sse_key, _mm_cmpgt_ps, SPU__RZ_ID)
+SPU__SSE_CMP(spu_fcmeq, _mm_cmpeq_epi32, spu__sse_mag, _mm_cmpeq_ps, SPU__RZ_ABS)
+SPU__SSE_CMP(spu_fcmgt, _mm_cmpgt_epi32, spu__sse_mag, _mm_cmpgt_ps, SPU__RZ_ABS)
 #undef SPU__SSE_CMP
+#undef SPU__RZ_ID
+#undef SPU__RZ_ABS
 #else
 static inline u128 spu_fceq(u128 a, u128 b)  { return spu_fceq_ref(a, b); }
 static inline u128 spu_fcgt(u128 a, u128 b)  { return spu_fcgt_ref(a, b); }
@@ -2240,19 +2262,52 @@ static inline u128 spu_cdd_pos(int pos) {
     r._u32[w] = 0x00010203u; r._u32[w + 1] = 0x04050607u;
     return r;
 }
+static inline u128 spu_cwd_ref(u128 a, int i7){ return spu_cwd_pos((int)a._u32[0]+i7); }
+#if SPU_X86 && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
+/* x86: every insertion control is one 16-byte load from a table indexed by the position (the _pos
+ * forms above store a byte, halfword or word into a u128 and then load it as a vector, which stalls
+ * on store forwarding). Host word w of the base pattern is 0x10111213 + w * 0x04040404; SPU byte p
+ * of word w is bits 8 * (3 - (p & 3)) of it. test_spu_int_x86 / test_spu_helpers check the tables
+ * against the _pos forms for every position. */
+#define SPU__CB(w) (0x10111213u + (uint32_t)(w) * 0x04040404u)
+#define SPU__CBD_W(p, w) ((w) == ((p) >> 2) ? ((SPU__CB(w) & ~(0xFFu << (8 * (3 - ((p) & 3))))) | (0x03u << (8 * (3 - ((p) & 3))))) : SPU__CB(w))
+#define SPU__CHD_W(p, w) ((w) == ((p) >> 2) ? (((p) & 2) ? ((SPU__CB(w) & 0xFFFF0000u) | 0x0203u) : ((SPU__CB(w) & 0xFFFFu) | 0x02030000u)) : SPU__CB(w))
+#define SPU__CWD_W(p, w) ((w) == ((p) >> 2) ? 0x00010203u : SPU__CB(w))
+#define SPU__CDD_W(p, w) ((w) == ((p) >> 2) ? 0x00010203u : (w) == ((p) >> 2) + 1 ? 0x04050607u : SPU__CB(w))
+#define SPU__C4(M, p) { M(p, 0), M(p, 1), M(p, 2), M(p, 3) }
+#define SPU__C16(M) SPU__C4(M, 0), SPU__C4(M, 1), SPU__C4(M, 2), SPU__C4(M, 3), SPU__C4(M, 4), SPU__C4(M, 5), \
+    SPU__C4(M, 6), SPU__C4(M, 7), SPU__C4(M, 8), SPU__C4(M, 9), SPU__C4(M, 10), SPU__C4(M, 11), SPU__C4(M, 12), \
+    SPU__C4(M, 13), SPU__C4(M, 14), SPU__C4(M, 15)
+static inline u128 spu__ctl_ld(const uint32_t (*t)[4], uint32_t pos) {
+    u128 r; memcpy(&r, t[pos & 0xF], 16); return r;
+}
+static inline u128 spu__cbd_t(uint32_t pos) { static const uint32_t t[16][4] __attribute__((aligned(16))) = { SPU__C16(SPU__CBD_W) }; return spu__ctl_ld(t, pos); }
+static inline u128 spu__chd_t(uint32_t pos) { static const uint32_t t[16][4] __attribute__((aligned(16))) = { SPU__C16(SPU__CHD_W) }; return spu__ctl_ld(t, pos & ~1u); }
+static inline u128 spu__cwd_t(uint32_t pos) { static const uint32_t t[16][4] __attribute__((aligned(16))) = { SPU__C16(SPU__CWD_W) }; return spu__ctl_ld(t, pos & ~3u); }
+static inline u128 spu__cdd_t(uint32_t pos) { static const uint32_t t[16][4] __attribute__((aligned(16))) = { SPU__C16(SPU__CDD_W) }; return spu__ctl_ld(t, pos & ~7u); }
+#undef SPU__C16
+#undef SPU__C4
+#undef SPU__CDD_W
+#undef SPU__CWD_W
+#undef SPU__CHD_W
+#undef SPU__CBD_W
+#undef SPU__CB
+static inline u128 spu_cbd(u128 a, int i7) { return spu__cbd_t(a._u32[0] + (uint32_t)i7); }
+static inline u128 spu_chd(u128 a, int i7) { return spu__chd_t(a._u32[0] + (uint32_t)i7); }
+static inline u128 spu_cwd(u128 a, int i7) { return spu__cwd_t(a._u32[0] + (uint32_t)i7); }
+static inline u128 spu_cdd(u128 a, int i7) { return spu__cdd_t(a._u32[0] + (uint32_t)i7); }
+static inline u128 spu_cbx(u128 a, u128 b) { return spu__cbd_t(a._u32[0] + b._u32[0]); }
+static inline u128 spu_chx(u128 a, u128 b) { return spu__chd_t(a._u32[0] + b._u32[0]); }
+static inline u128 spu_cwx(u128 a, u128 b) { return spu__cwd_t(a._u32[0] + b._u32[0]); }
+static inline u128 spu_cdx(u128 a, u128 b) { return spu__cdd_t(a._u32[0] + b._u32[0]); }
+#else
 static inline u128 spu_cbd(u128 a, int i7){ return spu_cbd_pos((int)a._u32[0]+i7); }
 static inline u128 spu_chd(u128 a, int i7){ return spu_chd_pos((int)a._u32[0]+i7); }
-static inline u128 spu_cwd_ref(u128 a, int i7){ return spu_cwd_pos((int)a._u32[0]+i7); }
 #if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
 static inline u128 spu_cwd(u128 a, int i7) {
     static const uint32_t base[4] = {0x10111213u, 0x14151617u, 0x18191A1Bu, 0x1C1D1E1Fu}, lane[4] = {0, 1, 2, 3};
     uint32x4_t m = vceqq_u32(vld1q_u32(lane), vdupq_n_u32((((uint32_t)a._u32[0] + (uint32_t)i7) >> 2) & 3));
     return spu__st(vbslq_u32(m, vdupq_n_u32(0x00010203u), vld1q_u32(base)));
-}
-#elif SPU_X86
-static inline u128 spu_cwd(u128 a, int i7) {
-    const __m128i m = _mm_cmpeq_epi32(_mm_setr_epi32(0, 1, 2, 3), _mm_set1_epi32((int)((((uint32_t)a._u32[0] + (uint32_t)i7) >> 2) & 3)));
-    return spu__xs(_mm_blendv_epi8(_mm_setr_epi32(0x10111213, 0x14151617, 0x18191A1B, 0x1C1D1E1F), _mm_set1_epi32(0x00010203), m));
 }
 #else
 static inline u128 spu_cwd(u128 a, int i7) { return spu_cwd_ref(a, i7); }
@@ -2262,6 +2317,7 @@ static inline u128 spu_cbx(u128 a, u128 b){ return spu_cbd_pos((int)(a._u32[0]+b
 static inline u128 spu_chx(u128 a, u128 b){ return spu_chd_pos((int)(a._u32[0]+b._u32[0])); }
 static inline u128 spu_cwx(u128 a, u128 b){ return spu_cwd_pos((int)(a._u32[0]+b._u32[0])); }
 static inline u128 spu_cdx(u128 a, u128 b){ return spu_cdd_pos((int)(a._u32[0]+b._u32[0])); }
+#endif
 
 /* ---- Phase 3: rotate-and-mask family ---- */
 static inline u128 spu_rotm_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); } return r; }
@@ -2721,7 +2777,17 @@ static inline u128 spu_xsbh(u128 a) {
 static inline u128 spu_xshw(u128 a) {
     return spu__xs(_mm_srai_epi32(_mm_slli_epi32(spu__xl(a), 16), 16));
 }
-static inline u128 spu_clz(u128 a) { return spu_clz_ref(a); }
+/* clz through the float exponent: x & ~(x >> 1) keeps the top set bit at p and clears p-1, so the
+ * value lies in [2^p, 1.5 * 2^p) and converts to a float of exponent 127 + p in any rounding mode
+ * (no lane can round up to 2^(p+1)); clz = 158 - exponent. Zero converts to 0.0: 158, clamped to 32.
+ * A lane with bit 31 set is negative as an int32: the shift by 23 brings the sign in (>= 256 +
+ * 157), so 158 minus it is negative and clamps to 0. 7 ops for the per-lane bsr loop. */
+static inline u128 spu_clz(u128 a) {
+    const __m128i x = spu__xl(a);
+    const __m128i e = _mm_srli_epi32(_mm_castps_si128(_mm_cvtepi32_ps(_mm_andnot_si128(_mm_srli_epi32(x, 1), x))), 23);
+    return spu__xs(_mm_min_epi32(_mm_max_epi32(_mm_sub_epi32(_mm_set1_epi32(158), e), _mm_setzero_si128()),
+                                 _mm_set1_epi32(32)));
+}
 static inline u128 spu_xswd(u128 a) { return spu_xswd_ref(a); }
 static inline u128 spu_orx(u128 a) { return spu_orx_ref(a); }
 static inline u128 spu_gb(u128 a) { return spu_gb_ref(a); }
