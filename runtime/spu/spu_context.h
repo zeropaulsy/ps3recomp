@@ -556,6 +556,33 @@ static inline __m128i spu_ls_bswap_words(__m128i x) {
 }
 #endif
 
+/* SPU_LS_IN_CTX (opt-in, per lifted source; x86 SPU_LS_VEC only): lqd/stqd address the context's
+ * own ls_store as an array of quadwords on ctx itself, instead of through the ctx->ls pointer.
+ *
+ * Why: lifted functions take `spu_context* __restrict ctx`, but GCC drops what restrict buys as
+ * soon as ctx escapes, i.e. is passed to anything it cannot see (spu_wrch, an SPU_DIRECT tail
+ * call into another non-trivial function). The pointer loaded from ctx->ls may then point into
+ * *ctx, so every LS store may overwrite ctx->gpr[]: each register written in a loop is stored
+ * back every iteration and each loop-invariant one reloaded (jobmod c9c2 func_54A0's loop:
+ * 177 ctx references per iteration). Addressed as ((view*)ctx)->q[i], an LS access is a known
+ * byte range of *ctx, [offsetof(ls_store), +256 KB), which GCC tells apart from gpr[n] by
+ * offset alone, escaped or not (same loop: 19).
+ *
+ * Only valid where ctx->ls == ctx->ls_store, i.e. NOT for code a raw SPU may run (spu_raw.c
+ * points a raw SPU's ls at the guest window). SPURS job modules always run on a SPURS thread's
+ * context. And every LS access of such a translation unit must go through these two helpers:
+ * a raw ctx->ls access beside them would not be "based on" ctx and could be reordered against
+ * them under restrict. The lifter emits nothing else (diagnostics are out-of-line calls). */
+#if defined(SPU_LS_IN_CTX) && SPU_LS_VEC && !defined(__cplusplus)
+#include <stddef.h>
+typedef struct {
+    uint8_t spu__before_ls[offsetof(spu_context, ls_store)];
+    __m128i q[SPU_LS_SIZE / 16];
+} spu__ls_view;
+_Static_assert(offsetof(spu__ls_view, q) == offsetof(spu_context, ls_store), "spu__ls_view layout");
+#define SPU_LS_Q(ctx, lsa) (((spu__ls_view*)(ctx))->q[(lsa) >> 4])
+#endif
+
 /* Debug probes of spu_ls_read128/write128, out of line: inlined they kept
  * every LS load a real call (~10% of GH3's FMOD mixer task).
  *
@@ -657,7 +684,10 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
         spu_ls_read_diag(ctx, lsa);
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
-#if defined(__ARM_NEON)
+#if defined(SPU_LS_Q)
+    (void)p;
+    _mm_storeu_si128((__m128i*)v._u8, spu_ls_bswap_words(SPU_LS_Q(ctx, lsa)));
+#elif defined(__ARM_NEON)
     vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));     /* ldr q; rev32 */
 #elif SPU_LS_VEC
     _mm_storeu_si128((__m128i*)v._u8, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)p)));
@@ -756,7 +786,10 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
     uint8_t* p = &ctx->ls[lsa];
-#if defined(__ARM_NEON)
+#if defined(SPU_LS_Q)
+    (void)p;
+    SPU_LS_Q(ctx, lsa) = spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)val._u8));
+#elif defined(__ARM_NEON)
     vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));   /* rev32; str q */
 #elif SPU_LS_VEC
     _mm_storeu_si128((__m128i*)p, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)val._u8)));
