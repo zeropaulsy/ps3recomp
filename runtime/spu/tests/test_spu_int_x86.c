@@ -59,7 +59,7 @@ int main(void) {
     for (long n = 0; n < 2000000; n++) {
         const u128 a = rv(), b = rv(), c = rv();
         const int imm = (int)(rnd() % 3 == 0 ? (int32_t)rword() : (int32_t)(rnd() % 256) - 128);
-        T2(spu_a); T2(spu_sf); T2(spu_and); T2(spu_or); T2(spu_xor);
+        T2(spu_a); T2(spu_sf); T2(spu_and); T2(spu_or); T2(spu_xor); T2(spu_nand); T2(spu_nor); T2(spu_andc); T2(spu_orc);
         T2(spu_ceq); T2(spu_cgt); T2(spu_clgt); T3(spu_selb);
         TI(spu_ai); TI(spu_sfi); TI(spu_andi); TI(spu_ori); TI(spu_xori);
         TI(spu_ceqi); TI(spu_cgti); TI(spu_clgti);
@@ -75,7 +75,7 @@ int main(void) {
         TI(spu_ahi); TI(spu_sfhi); TI(spu_mpyi); TI(spu_mpyui);
         TI(spu_rothi); TI(spu_roti); TI(spu_rotmahi); TI(spu_rotmai);
         T3(spu_mpya); T3(spu_mpyhha); T3(spu_mpyhhau); T3(spu_addx); T3(spu_sfx);
-        T1(spu_cntb); T1(spu_xsbh); T1(spu_xshw); T1(spu_clz);
+        T1(spu_cntb); T1(spu_xsbh); T1(spu_xshw); T1(spu_clz); T1(spu_fsm); T1(spu_fsmh); T1(spu_fsmb);
         { u128 t = a; t._u32[1] = 1u << (rnd() & 31); t._u32[2] = t._u32[2] >> (rnd() & 31);   /* every clz */
           cmp("spu_clz", spu_clz(t), spu_clz_ref(t), t, z, z, 0); }
         const int pos = (int)rnd();
@@ -97,6 +97,10 @@ int main(void) {
         const u128 pa = spu_il(p);
         cmp("cbd16", spu_cbd(pa, 0), ref_cbd_pos(p), pa, z, z, p); cmp("chd16", spu_chd(pa, 0), ref_chd_pos(p), pa, z, z, p);
         cmp("cwd16", spu_cwd(pa, 0), ref_cwd_pos(p), pa, z, z, p); cmp("cdd16", spu_cdd(pa, 0), ref_cdd_pos(p), pa, z, z, p);
+    }
+    for (int m = -2; m < 0x10002; m++) {   /* fsmbi: every immediate (bits above 15 ignored) */
+        const u128 z0 = spu_zero();
+        cmp("fsmbi", spu_fsmbi(m), spu_fsmbi_ref(m), z0, z0, z0, m);
     }
     printf(s_fail ? "%d FAILURES\n" : "all x86 SPU helpers match their references\n", s_fail);
     return s_fail != 0;

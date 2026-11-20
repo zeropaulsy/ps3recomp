@@ -1437,7 +1437,10 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 /* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
-u128 spu_rdch(spu_context* ctx, uint32_t channel)
+/* The value as a plain word. Lifted code built with SPU_RDCH_U32 calls this
+ * through an inline spu_rdch (spu_helpers.h), so the register write is one
+ * 16-byte store instead of the rax:rdx halves a u128 return comes back in. */
+uint32_t spu_rdch_u32(spu_context* ctx, uint32_t channel)
 {
     spu_honour_stop_request(ctx);
     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
@@ -1471,8 +1474,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
             (unsigned long long)s_c[8],(unsigned long long)s_c[9]); } }
 
     if (channel_is_mfc(channel)) {
-        v = mfc_channel_read(mfc_for(ctx), ctx, channel);
-        return spu_make_preferred_u32(v);
+        return mfc_channel_read(mfc_for(ctx), ctx, channel);
     }
 
     switch (channel) {
@@ -1528,7 +1530,12 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
         v = 0;
         break;
     }
-    return spu_make_preferred_u32(v);
+    return v;
+}
+
+u128 spu_rdch(spu_context* ctx, uint32_t channel)
+{
+    return spu_make_preferred_u32(spu_rdch_u32(ctx, channel));
 }
 
 /* ===========================================================================

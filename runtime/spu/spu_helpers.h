@@ -380,10 +380,24 @@ static inline u128 spu_xor(u128 a, u128 b) {
 #else
 static inline u128 spu_xor(u128 a, u128 b) { return spu_xor_ref(a, b); }
 #endif
-static inline u128 spu_nand(u128 a, u128 b){ u128 r; r._u64[0]=~(a._u64[0]&b._u64[0]); r._u64[1]=~(a._u64[1]&b._u64[1]); return r; }
-static inline u128 spu_nor(u128 a, u128 b) { u128 r; r._u64[0]=~(a._u64[0]|b._u64[0]); r._u64[1]=~(a._u64[1]|b._u64[1]); return r; }
-static inline u128 spu_andc(u128 a, u128 b){ u128 r; r._u64[0]=a._u64[0]&~b._u64[0]; r._u64[1]=a._u64[1]&~b._u64[1]; return r; }
-static inline u128 spu_orc(u128 a, u128 b) { u128 r; r._u64[0]=a._u64[0]|~b._u64[0]; r._u64[1]=a._u64[1]|~b._u64[1]; return r; }
+static inline u128 spu_nand_ref(u128 a, u128 b){ u128 r; r._u64[0]=~(a._u64[0]&b._u64[0]); r._u64[1]=~(a._u64[1]&b._u64[1]); return r; }
+static inline u128 spu_nor_ref(u128 a, u128 b) { u128 r; r._u64[0]=~(a._u64[0]|b._u64[0]); r._u64[1]=~(a._u64[1]|b._u64[1]); return r; }
+static inline u128 spu_andc_ref(u128 a, u128 b){ u128 r; r._u64[0]=a._u64[0]&~b._u64[0]; r._u64[1]=a._u64[1]&~b._u64[1]; return r; }
+static inline u128 spu_orc_ref(u128 a, u128 b) { u128 r; r._u64[0]=a._u64[0]|~b._u64[0]; r._u64[1]=a._u64[1]|~b._u64[1]; return r; }
+#if SPU_X86
+/* Vector forms: GCC computed the scalar ones on the two 64-bit halves in GPRs and
+ * stored them as two 8-byte halves, so the next 16-byte read of the register was
+ * a store-forwarding failure (seen for nor/andc in hot job and policy code). */
+static inline u128 spu_nand(u128 a, u128 b){ return spu__xs(_mm_xor_si128(_mm_and_si128(spu__xl(a), spu__xl(b)), _mm_set1_epi32(-1))); }
+static inline u128 spu_nor(u128 a, u128 b) { return spu__xs(_mm_xor_si128(_mm_or_si128(spu__xl(a), spu__xl(b)), _mm_set1_epi32(-1))); }
+static inline u128 spu_andc(u128 a, u128 b){ return spu__xs(_mm_andnot_si128(spu__xl(b), spu__xl(a))); }
+static inline u128 spu_orc(u128 a, u128 b) { return spu__xs(_mm_or_si128(spu__xl(a), _mm_xor_si128(spu__xl(b), _mm_set1_epi32(-1)))); }
+#else
+static inline u128 spu_nand(u128 a, u128 b){ return spu_nand_ref(a, b); }
+static inline u128 spu_nor(u128 a, u128 b) { return spu_nor_ref(a, b); }
+static inline u128 spu_andc(u128 a, u128 b){ return spu_andc_ref(a, b); }
+static inline u128 spu_orc(u128 a, u128 b) { return spu_orc_ref(a, b); }
+#endif
 static inline u128 spu_andi_ref(u128 a, int32_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]&(uint32_t)imm; return r; }
 #if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
 static inline u128 spu_andi(u128 a, int32_t imm) {
@@ -2219,10 +2233,31 @@ static inline u128 spu_fsmb_ref(u128 a) {
     for(int i=0;i<16;i++) r._u8[SPU_W(i)] = ((v>>(15-i))&1) ? 0xFFu : 0;
     return r;
 }
-static inline u128 spu_fsmbi(int32_t imm) {
+static inline u128 spu_fsmbi_ref(int32_t imm) {
     u128 r; uint32_t v = imm & 0xFFFF;
     for(int i=0;i<16;i++) r._u8[SPU_W(i)] = ((v>>(15-i))&1) ? 0xFFu : 0;
     return r;
+}
+/* Word k holds SPU bytes 4k..4k+3, most significant first (SPU_W), so it is nibble
+ * (imm >> (12 - 4k)) spread to bytes. Written as whole words: with a constant imm
+ * (every lifted fsmbi) GCC folds this to one constant, where the byte loop above was
+ * sometimes built on the stack with 8-byte stores and read back as a vector (a
+ * store-forwarding failure each time). */
+static inline uint32_t spu__fsm_nib(uint32_t n) {
+    return ((n >> 3) & 1u) * 0xFF000000u | ((n >> 2) & 1u) * 0x00FF0000u |
+           ((n >> 1) & 1u) * 0x0000FF00u | (n & 1u) * 0x000000FFu;
+}
+static inline u128 spu_fsmbi(int32_t imm) {
+    const uint32_t v = (uint32_t)imm;
+#if SPU_X86
+    return spu__xs(_mm_setr_epi32((int)spu__fsm_nib(v >> 12), (int)spu__fsm_nib(v >> 8),
+                                  (int)spu__fsm_nib(v >> 4), (int)spu__fsm_nib(v)));
+#else
+    u128 r;
+    r._u32[0] = spu__fsm_nib(v >> 12); r._u32[1] = spu__fsm_nib(v >> 8);
+    r._u32[2] = spu__fsm_nib(v >> 4);  r._u32[3] = spu__fsm_nib(v);
+    return r;
+#endif
 }
 
 /* ---- Phase 3: constant generators (insertion shuffle patterns) ---- */
@@ -2793,9 +2828,24 @@ static inline u128 spu_orx(u128 a) { return spu_orx_ref(a); }
 static inline u128 spu_gb(u128 a) { return spu_gb_ref(a); }
 static inline u128 spu_gbh(u128 a) { return spu_gbh_ref(a); }
 static inline u128 spu_gbb(u128 a) { return spu_gbb_ref(a); }
-static inline u128 spu_fsm(u128 a) { return spu_fsm_ref(a); }
-static inline u128 spu_fsmh(u128 a) { return spu_fsmh_ref(a); }
-static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
+/* fsm/fsmh/fsmb: broadcast the bits, test each lane's bit (same weights as the NEON
+ * forms above). The scalar forms built the mask lane by lane on the stack and then
+ * read it back as a vector: a store-forwarding failure per use. */
+static inline u128 spu_fsm(u128 a) {
+    const __m128i w = _mm_setr_epi32(8, 4, 2, 1);
+    return spu__xs(_mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32((int)a._u32[0]), w), w));
+}
+static inline u128 spu_fsmh(u128 a) {
+    const __m128i w = _mm_setr_epi16(64, 128, 16, 32, 4, 8, 1, 2);
+    return spu__xs(_mm_cmpeq_epi16(_mm_and_si128(_mm_set1_epi16((short)a._u32[0]), w), w));
+}
+static inline u128 spu_fsmb(u128 a) {
+    /* host bytes 0-7 test the high byte of the 16 bits (SPU bytes 0-7), 8-15 the low byte */
+    const __m128i w = _mm_setr_epi8(16, 32, 64, (char)128, 1, 2, 4, 8, 16, 32, 64, (char)128, 1, 2, 4, 8);
+    const __m128i v = _mm_shuffle_epi8(_mm_cvtsi32_si128((int)a._u32[0]),
+                                       _mm_setr_epi8(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0));
+    return spu__xs(_mm_cmpeq_epi8(_mm_and_si128(v, w), w));
+}
 #else
 static inline u128 spu_absdb(u128 a, u128 b) { return spu_absdb_ref(a, b); }
 static inline u128 spu_avgb(u128 a, u128 b) { return spu_avgb_ref(a, b); }
@@ -2857,6 +2907,24 @@ static inline u128 spu_gbb(u128 a) { return spu_gbb_ref(a); }
 static inline u128 spu_fsm(u128 a) { return spu_fsm_ref(a); }
 static inline u128 spu_fsmh(u128 a) { return spu_fsmh_ref(a); }
 static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
+#endif
+
+/* SPU_RDCH_U32 (set by the build for lifted sources; SPU_IB_DISPATCH marks a
+ * lifted spu_recomp.h): `ctx->gpr[rt] = spu_rdch(ctx, ch)` goes through
+ * spu_rdch_u32 and builds the register here. A u128 return arrives in rax:rdx
+ * (the union is INTEGER class), and its two 8-byte stores into ctx->gpr make
+ * the next 16-byte read of that register a store-forwarding failure. Test
+ * harnesses that stub spu_rdch leave SPU_RDCH_U32 unset. */
+#if defined(SPU_RDCH_U32) && defined(SPU_IB_DISPATCH)
+#ifdef __cplusplus
+extern "C"
+#endif
+uint32_t spu_rdch_u32(spu_context* ctx, uint32_t channel);
+static inline u128 spu_rdch_inl(spu_context* ctx, uint32_t channel)
+{
+    return spu_make_preferred_u32(spu_rdch_u32(ctx, channel));
+}
+#define spu_rdch(ctx, ch) spu_rdch_inl((ctx), (ch))
 #endif
 
 #endif /* SPU_HELPERS_H */

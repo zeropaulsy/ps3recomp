@@ -16,6 +16,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -842,10 +845,22 @@ static inline uint64_t spu_preferred_u64(const u128* reg)
 /* Create a register with a value splatted to the preferred word slot */
 static inline u128 spu_make_preferred_u32(uint32_t val)
 {
+    /* Built in a register, not as memset + a word store: GCC spilled that form
+     * to the stack and reloaded it wider (8-byte and 16-byte loads over 4-byte
+     * stores), a store-forwarding failure on every call. Stored into ctx->gpr
+     * this is now one vmovd + one 16-byte store, which later vector reads of
+     * the register can forward from. */
+#if defined(__SSE2__)
+    __m128i x = _mm_cvtsi32_si128((int)val);
+    u128 r;
+    memcpy(&r, &x, sizeof(r));
+    return r;
+#else
     u128 r;
     memset(&r, 0, sizeof(r));
     r._u32[0] = val;
     return r;
+#endif
 }
 
 /* ---------------------------------------------------------------------------
