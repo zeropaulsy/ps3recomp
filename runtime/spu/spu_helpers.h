@@ -2000,17 +2000,14 @@ SPU__XE_INLINE u128 spu_fi(u128 a, u128 b) {
     const __m128i zero = _mm_or_si128(_mm_cmpeq_epi32(exp, _mm_setzero_si128()), _mm_cmpeq_epi32(e2, _mm_setzero_si128()));
     return spu__xe_st(_mm_andnot_si128(zero, r));
 }
-/* tbl[idx] for idx < 8 * n, n eight-entry rows: one cross-lane permute per row, then a select
- * on the row number (a gather is slow on several x86 cores for four lanes). */
+/* tbl[idx] for idx < 8 * n: four scalar loads, put together in a register (vmovd + vpinsrd).
+ * The old form (one cross-lane permute per eight-entry row, then a compare + blend per row) had
+ * ~3x lower throughput for the 64-entry frsqest table on Zen 3 at the same latency. A gather is
+ * about as fast on Zen 3 but very slow on Intel cores with the GDS microcode fix. */
 SPU__XE_INLINE __m128i spu__xe_lut(const uint32_t* tbl, int n, __m128i idx) {
-    const __m256i i8 = _mm256_castsi128_si256(idx);
-    const __m128i row = _mm_srli_epi32(idx, 3);
-    __m128i r = _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i*)tbl), i8));
-    for (int k = 1; k < n; k++) {
-        const __m128i v = _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i*)(tbl + 8 * k)), i8));
-        r = _mm_blendv_epi8(r, v, _mm_cmpeq_epi32(row, _mm_set1_epi32(k)));
-    }
-    return r;
+    (void)n;
+    return _mm_setr_epi32((int)tbl[_mm_extract_epi32(idx, 0)], (int)tbl[_mm_extract_epi32(idx, 1)],
+                          (int)tbl[_mm_extract_epi32(idx, 2)], (int)tbl[_mm_extract_epi32(idx, 3)]);
 }
 SPU__XE_INLINE u128 spu_frest(u128 a) {
     const __m128i x = spu__xe_ld(a);
