@@ -4993,8 +4993,17 @@ void cellGcmSetUserCommand(u32 cmd)
  * the cause and pending marker is atomic; guest code runs later in the pump.
  * Like the driver cause register, multiple pending commands coalesce. */
 static int gcm_ucmd_log_on(void);
+/* A title's hook on each user command the FIFO walker retires, called on the
+ * walker before the command is queued for the guest handler. The walker
+ * consumes a frame's commands within milliseconds of the title writing them;
+ * the real RSX is usually a frame behind. A title whose handler releases
+ * something its PPU arms only after writing the command (LittleBigPlanet 2's
+ * per-frame SPU job gates) can use it to hold the walker, bounded, until the
+ * PPU has caught up. NULL (the default) changes nothing. */
+void (*g_gcm_user_cmd_retire_hook)(u32 cmd) = NULL;
 void cellGcmQueueUserCommand(u32 cmd)
 {
+    if (g_gcm_user_cmd_retire_hook) g_gcm_user_cmd_retire_hook(cmd);
     GCM_USER_STORE(cmd);
     if (gcm_ucmd_log_on()) { extern unsigned long long ps3_ms_now(void);
         fprintf(stderr, "[ucmd] %llu ms retire 0x%08X get 0x%08X\n", ps3_ms_now(), cmd, s_fifo_getoff); }

@@ -2374,6 +2374,37 @@ s32 cellSpursWakeUp(CellSpurs* spurs)
     return CELL_OK;
 }
 
+/* Diagnostic: every live instance's lanes (busy, workload, image) and its
+ * enabled workloads (state, readyCount, signal, active/maxContention, idle
+ * back-off). Reads without locks: meant for a stalled process (a title's stall
+ * watchdog), where a racy snapshot beats one that can block. */
+void cellSpurs_debug_dump(const char* tag)
+{
+    for (int i = 0; i < MAX_SPURS_INST; i++) {
+        struct SpursInst* si = &s_inst[i];
+        u32 ea = __atomic_load_n(&si->ea, __ATOMIC_ACQUIRE);
+        if (!ea || !si->kernel_live) continue;
+        u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
+        fprintf(stderr, "[%s] spurs 0x%08X nspus %u pass %u kick %d enabled 0x%08X\n",
+                tag, ea, si->nspus, si->pass_no, si->kick, enabled);
+        for (u32 sn = 0; sn < si->nspus && sn < 6; sn++) {
+            struct SpursPmSlot* s = &si->slots[sn];
+            fprintf(stderr, "[%s]   lane %u busy %d wid %u img %d\n", tag, sn,
+                    __atomic_load_n(&s->busy, __ATOMIC_ACQUIRE), s->wid, s->image_id);
+        }
+        const u32 nwid = si->is2 ? SPURS_MAX_WID : 16u;
+        for (u32 wid = 0; wid < nwid; wid++) {
+            if (!(enabled & (0x80000000u >> wid))) continue;
+            fprintf(stderr, "[%s]   wid %2u data %08X state %u ready %u signal %u active %u maxcont %u idle %u inuse %d\n",
+                    tag, wid, (u32)vm_read64(ea + wkl_info_off(wid) + 8),
+                    vm_read8(ea + wkl_state_off(wid)), vm_read8(ea + wkl_ready_off(wid)),
+                    (vm_read16(ea + wkl_signal_off(wid)) & wkl_signal_bit(wid)) ? 1u : 0u,
+                    si->active[wid], wkl_count_get(ea, SPURS_WKL_MAXCONT, wid, si->is2), si->idle[wid],
+                    s_workloads[wid].in_use);
+        }
+    }
+}
+
 /* =========================================================================
  * Event flags
  * =====================================================================*/
