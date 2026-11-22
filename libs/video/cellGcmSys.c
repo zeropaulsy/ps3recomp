@@ -155,6 +155,75 @@ int cellGcm_take_flip_pending(void)
     return v;
 }
 
+/* GCM_HITCH_MS detail: what each frame interval contained, printed on its
+ * [hitch] line. Slots are time sums (count + ms) from the host and backend
+ * (gcm_hitch_note: shader translation, pipeline creation, present) or maxima
+ * (gcm_hitch_note_max: vblank tick lateness, tick-to-handler delay); acq lists
+ * the semaphore acquires the drain blocked on, as label@first-last ms after
+ * the previous flip, so a frame's "ready" time (the park on the vsync label)
+ * can be told from work that finished late. */
+#define GCM_HD_SLOTS 6
+static const char* const s_hd_name[GCM_HD_SLOTS] = { "xl", "pl", "pr", "late", "hdly", "fifo" };
+static volatile u64 s_hd_ns[GCM_HD_SLOTS];
+static volatile u32 s_hd_n[GCM_HD_SLOTS];
+#define GCM_HD_ACQ 8
+static struct { u32 label, get; u64 t0, t1; } s_hd_acq[GCM_HD_ACQ];
+static u32 s_hd_nacq, s_hd_acq_drop;
+static u64 s_hd_last_flip_ns;
+static volatile u64 s_hd_last_tick_ns;
+int gcm_hitch_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("GCM_HITCH_MS"); v = (e && *e) ? 1 : 0; }
+    return v;
+}
+void gcm_hitch_note(unsigned slot, unsigned long long ns)
+{
+    if (slot >= GCM_HD_SLOTS) return;
+    __atomic_add_fetch(&s_hd_ns[slot], (u64)ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&s_hd_n[slot], 1u, __ATOMIC_RELAXED);
+}
+void gcm_hitch_note_max(unsigned slot, unsigned long long ns)
+{
+    if (slot >= GCM_HD_SLOTS) return;
+    u64 cur = __atomic_load_n(&s_hd_ns[slot], __ATOMIC_RELAXED);
+    while (ns > cur && !__atomic_compare_exchange_n(&s_hd_ns[slot], &cur, (u64)ns, 0,
+                                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    __atomic_add_fetch(&s_hd_n[slot], 1u, __ATOMIC_RELAXED);
+}
+unsigned long long gcm_hitch_now_ns(void);
+/* Drain thread: the acquire at get on label li blocked at time t. */
+static void gcm_hitch_acq_blocked(u32 li, u32 get, u64 t)
+{
+    if (s_hd_nacq && s_hd_acq[s_hd_nacq - 1].get == get && s_hd_acq[s_hd_nacq - 1].label == li) {
+        s_hd_acq[s_hd_nacq - 1].t1 = t; return;
+    }
+    if (s_hd_nacq == GCM_HD_ACQ) { s_hd_acq_drop++; memmove(&s_hd_acq[0], &s_hd_acq[1], sizeof s_hd_acq[0] * (GCM_HD_ACQ - 1)); s_hd_nacq--; }
+    s_hd_acq[s_hd_nacq].label = li; s_hd_acq[s_hd_nacq].get = get;
+    s_hd_acq[s_hd_nacq].t0 = s_hd_acq[s_hd_nacq].t1 = t; s_hd_nacq++;
+}
+static void gcm_hitch_detail(char* out, size_t cap, u64 now)
+{
+    size_t o = 0;
+    for (unsigned i = 0; i < GCM_HD_SLOTS && o < cap; i++) {
+        const u64 ns = __atomic_exchange_n(&s_hd_ns[i], 0, __ATOMIC_RELAXED);
+        const u32 n = __atomic_exchange_n(&s_hd_n[i], 0u, __ATOMIC_RELAXED);
+        if (!n) continue;
+        if (i == 3 || i == 4) o += (size_t)snprintf(out + o, cap - o, " %s %.1f", s_hd_name[i], ns / 1e6);
+        else                  o += (size_t)snprintf(out + o, cap - o, " %s %u/%.1f", s_hd_name[i], n, ns / 1e6);
+    }
+    if (o < cap && s_hd_nacq) {
+        o += (size_t)snprintf(out + o, cap - o, " acq%s", s_hd_acq_drop ? "+" : "");
+        for (u32 k = 0; k < s_hd_nacq && o < cap; k++) {
+            const u64 b = s_hd_last_flip_ns;
+            o += (size_t)snprintf(out + o, cap - o, " %02X@%.1f-%.1f", s_hd_acq[k].label,
+                                  (s_hd_acq[k].t0 - b) / 1e6, (s_hd_acq[k].t1 - b) / 1e6);
+        }
+    }
+    s_hd_nacq = 0; s_hd_acq_drop = 0; s_hd_last_flip_ns = now;
+    if (o >= cap) out[cap - 1] = 0;
+}
+
 /* The flip now names this buffer. The shared draw engine presents on the
  * host's call and only learns a buffer from 0xE944 by itself, so it would
  * keep presenting display buffer 0 for a title that flips through 0xFEAD. */
@@ -169,9 +238,11 @@ static void gcm_set_current_display_buffer(u32 bufferId)
           const u64 now = get_timestamp_ns();
           if (!t0) t0 = now;
           ++n;
+          char det[512]; det[0] = 0;
+          gcm_hitch_detail(det, sizeof det, now);
           if (last && now - last > (u64)lim * 1000000ull)
-              fprintf(stderr, "[hitch] flip %llu at %.3f s took %.1f ms%c", (unsigned long long)n,
-                      (now - t0) / 1e9, (now - last) / 1e6, 10);
+              fprintf(stderr, "[hitch] flip %llu at %.3f s took %.1f ms%s%c", (unsigned long long)n,
+                      (now - t0) / 1e9, (now - last) / 1e6, det, 10);
           last = now;
       } }
     s_current_display_buffer_id = bufferId;
@@ -990,6 +1061,31 @@ static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
 #endif
 
+/* Vblanks ticked but not yet handed to the guest's vblank handler. The pending
+ * word is a bit, so two ticks that land before the next pump used to merge into
+ * one handler call. A title that paces itself by counting vblanks in that
+ * handler then lost one: LBP2's handler counts 2 down to write the label its
+ * flip waits on, and every merged pair turned a 33 ms frame into a 50 ms one
+ * (~2 a second while walking, 4% of the ticks). On the PS3 every vblank
+ * raises its own interrupt. GCM_VBLANK_EACH=<n>: deliver one call per tick,
+ * at most n per pump (default 4; older ticks beyond that are dropped, as a
+ * long stall should not replay a burst); 0 = the old merging behaviour. */
+#ifdef _WIN32
+static volatile LONG s_vblank_backlog = 0;
+#define GCM_VBLANK_BACKLOG_ADD()  InterlockedIncrement(&s_vblank_backlog)
+#define GCM_VBLANK_BACKLOG_TAKE() ((u32)InterlockedExchange(&s_vblank_backlog, 0))
+#else
+static volatile int s_vblank_backlog = 0;
+#define GCM_VBLANK_BACKLOG_ADD()  __atomic_add_fetch(&s_vblank_backlog, 1, __ATOMIC_RELAXED)
+#define GCM_VBLANK_BACKLOG_TAKE() ((u32)__atomic_exchange_n(&s_vblank_backlog, 0, __ATOMIC_ACQ_REL))
+#endif
+static u32 gcm_vblank_each_max(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("GCM_VBLANK_EACH"); v = (e && *e) ? atoi(e) : 4; if (v < 0) v = 0; }
+    return (u32)v;
+}
+
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
  * and mark a vblank+flip tick pending for the main thread to deliver. */
 static u32 s_fifo_getoff;   /* tentative: defined below */
@@ -997,6 +1093,7 @@ static u32 s_fifo_getoff;   /* tentative: defined below */
 void cellGcm_request_tick(void)
 {
     s_vblank_count++;
+    GCM_VBLANK_BACKLOG_ADD();
     /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
      * actually consumed up to `put`.
      *
@@ -1135,17 +1232,31 @@ void ppu_gcm_pump(void)
     } else {
         user = GCM_USER_PENDING_TAKE();
     }
+    /* How many vblank handler calls this pump owes: one per tick since the
+     * last pump (GCM_VBLANK_EACH), or one for any number (=0). The backlog is
+     * claimed after the pending word, so a tick between the two is delivered
+     * now and its bit finds an empty backlog next time (no call then). */
+    u32 nvb = 0, vbase = s_vblank_count;
+    if (p & 1) {
+        const u32 maxn = gcm_vblank_each_max();
+        const u32 owed = GCM_VBLANK_BACKLOG_TAKE();
+        nvb = maxn ? (owed < maxn ? owed : maxn) : 1u;
+        vbase = s_vblank_count - (nvb ? nvb - 1u : 0u);
+    }
     /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
     { static int d = -1; static unsigned nv, nf, calls;
       if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
-      if (d) { calls++; if (p & 1) nv++; if (p & 2) nf++;
+      if (d) { calls++; nv += nvb; if (p & 2) nf++;
                if ((calls % 20000) == 0)
                    fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
                            calls, nv, nf, s_vblank_count, 10); } }
-    if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
+    if (nvb && s_vblank_handler_opd && g_ps3_guest_caller) {
+        if (gcm_hitch_on()) { const u64 tk = __atomic_load_n(&s_hd_last_tick_ns, __ATOMIC_RELAXED);
+                              if (tk) gcm_hitch_note_max(4, get_timestamp_ns() - tk); }
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
-        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
-                           0, 0, 0, 0, 0, 0, 0);
+        for (u32 i = 0; i < nvb; i++)
+            g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)(vbase + i),
+                               0, 0, 0, 0, 0, 0, 0);
     }
     if (p & 2) {
         /* Delivery waits for a guest thread to reach an HLE call or a timer
@@ -1182,7 +1293,12 @@ void ppu_gcm_pump(void)
 
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
  * caller other than the ticker still works) -- delivery stays on the main thread. */
-void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+void cellGcmTickVBlank(void)
+{
+    if (gcm_hitch_on()) __atomic_store_n(&s_hd_last_tick_ns, get_timestamp_ns(), __ATOMIC_RELAXED);
+    s_vblank_count++; GCM_VBLANK_BACKLOG_ADD(); GCM_PENDING_SET(1);
+}
+unsigned long long gcm_hitch_now_ns(void) { return get_timestamp_ns(); }
 /* Only deliver a flip completion when a flip is actually outstanding.
  *
  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
@@ -3098,6 +3214,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
 #endif
                 if (!blk_ms || now - s_acq_t0 < blk_ms) {
                     if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
+                    if (gcm_hitch_on()) gcm_hitch_acq_blocked((s_sema_offset >> 4) & 0xFFu, s_fifo_getoff, get_timestamp_ns());
                     sem_blocked = 1; break;
                 }
                 if (gcm_sema_stats_on()) { const u32 li = (s_sema_offset >> 4) & 0xFFu;

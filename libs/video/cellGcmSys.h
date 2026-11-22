@@ -461,4 +461,19 @@ u32 cellGcmGetReportDataLocation(u32 index, u32 location);
 }
 #endif
 
+/* GCM_HITCH_MS detail (cellGcmSys.c): per-frame-interval sums and maxima
+ * printed on each [hitch] line. Slots: 0 shader translation, 1 pipeline
+ * creation, 2 present, 3 vblank tick lateness (max), 4 tick-to-handler delay
+ * (max), 5 FIFO drain. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+int  gcm_hitch_on(void);
+void gcm_hitch_note(unsigned slot, unsigned long long ns);
+void gcm_hitch_note_max(unsigned slot, unsigned long long ns);
+unsigned long long gcm_hitch_now_ns(void);
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* PS3RECOMP_CELL_GCM_SYS_H */
