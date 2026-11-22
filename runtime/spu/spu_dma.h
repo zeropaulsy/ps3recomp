@@ -646,6 +646,25 @@ static SPU_NOINLINE_COLD void mfc_diag_get_done(spu_context* spu, uint32_t lsa, 
     (void)spu; (void)lsa; (void)ea; (void)size; (void)cmd;
 }
 
+/* SPU_DMASTAT=1 (diagnostic): bytes moved per (image, LS address, size, direction) on each
+ * thread, printed every 10 s. -1 until the environment is read. */
+/* Weak, so test programs that include this header without spu_channels.c still link. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define SPU_DMA_WEAK __attribute__((weak))
+#else
+#  define SPU_DMA_WEAK
+#endif
+extern int g_spu_dmastat SPU_DMA_WEAK;
+void spu_dmastat_note(spu_context* spu, uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size, int path) SPU_DMA_WEAK;
+#define SPU_DMASTAT(spu, cmd, lsa, ea, size, path) \
+    do { if (&g_spu_dmastat && __builtin_expect(g_spu_dmastat != 0, 0)) \
+             spu_dmastat_note(spu, cmd, lsa, ea, size, path); } while (0)
+/* SPU_DMA_DEFER (spu_channels.c): queue a plain GET's copy for the next channel operation.
+ * Returns 1 if queued (the copy and spu_overlay_note_get run at the flush), 0 to copy now.
+ * spu_dgq_flush_all runs the queue now. */
+int spu_dgq_push(spu_context* spu, uint8_t* dst, const uint8_t* src, uint32_t size, uint32_t ea) SPU_DMA_WEAK;
+void spu_dgq_flush_all(void) SPU_DMA_WEAK;
+
 /* The copy half of a plain PUT (see mfc_do_transfer): lines another SPU holds a reservation on
  * are copied and notified under the lock-line lock, the rest lock-free. Shared with the lean
  * MFC command path in spu_channels.c. */
@@ -895,6 +914,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     if (mfc_is_get(cmd)) {
         if (mfc_diag_on()) mfc_diag_get_src(spu, lsa, ea, size, cmd);
         /* GET: main memory -> local store */
+        SPU_DMASTAT(spu, cmd, lsa, (uint32_t)ea, size, 1);
+        if (spu_dgq_push && !mfc_diag_on() && spu_dgq_push(spu, ls_ptr, ea_ptr, size, (uint32_t)ea))
+            return 0;
         memcpy(ls_ptr, ea_ptr, size);
         /* Swappable-overlay tracking: a GET from a registered overlay source
          * (by EA or by content signature) marks that overlay's lifted
@@ -935,6 +957,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         {
             extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
             spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
+            SPU_DMASTAT(spu, cmd, lsa, (uint32_t)ea, size, 1);
             mfc_put_copy(spu, (uint32_t)ea, ls_ptr, ea_ptr, size);
         }
         /* Tell whoever is listening where this PUT landed.
@@ -1034,6 +1057,8 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
         }
 
         if (stall_notify) {
+            /* The handler of the stall event processes the elements before it. */
+            if (spu_dgq_flush_all) spu_dgq_flush_all();
             uint32_t t = tag & 0x1F;
             spu->list_stall_elem_lsa[t]  = (el + 8) & SPU_LS_MASK;
             spu->list_stall_remaining[t] = num_left - i - 1;

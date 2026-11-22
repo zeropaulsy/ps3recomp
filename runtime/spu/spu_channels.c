@@ -36,6 +36,9 @@
 #endif
 #ifndef _WIN32
 #include <sched.h>   /* sched_yield */
+#ifdef __linux__
+#include <sys/prctl.h> /* PR_GET_NAME (SPU_DMASTAT) */
+#endif
 #endif
 #include <time.h>
 #include "../platform/win32_compat.h"
@@ -177,8 +180,130 @@ void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
  * installed, so a title with no SPU-built FIFO pays nothing. */
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
 
+/* SPU_DMA_DEFER=1: plain GETs of the lean path (spu_wrch_mfc_cmd) are queued instead of
+ * copied at issue. The issue prefetches the source lines; the copies run at the SPU's next
+ * channel operation (a tag wait, a PUT, any read or count, any other write), at stop, halt,
+ * and on entry to and exit from spu_run_with_halt. A program may only read a GET's
+ * destination after waiting for its tag, which is a channel operation, so it cannot see the
+ * difference -- but the source misses of several GETs now overlap: lane 0's GET sources come
+ * from DRAM (memmove took 41% of its DRAM fills), and one synchronous copy per GET paid each
+ * miss in series. The queue is per host thread (one context runs on a thread at a time; a
+ * nested run flushes on entry), so spu_context does not change. */
+#define SPU_DGQ_MAX 16
+typedef struct { uint8_t* dst; const uint8_t* src; uint32_t size, ea; } spu_dgq_ent;
+/* A ring: h = oldest entry. SPU_DGQ_RING=1: a GET into a full queue copies only the oldest
+ * entry (a long list keeps its prefetches SPU_DGQ_MAX GETs ahead); else the whole queue. */
+static __thread struct { spu_context* ctx; uint32_t n, h; spu_dgq_ent e[SPU_DGQ_MAX]; } t_dgq;
+static int s_dgq_ring;
+static int s_dma_defer = -1;
+void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size);
+/* SPU_DGQSTAT=1 (diagnostic, with SPU_DMA_DEFER=1): per thread every 10 s, GETs per flush,
+ * TSC ticks from the first queued GET to its flush (log2), and the flush call sites (return
+ * address minus &spu_halt; resolve with nm). */
+static int s_dgqstat;
+void spu_halt(spu_context* ctx);
+static __thread unsigned long long t_dgq_t0;
+typedef struct { uint32_t img, lsa, size, last_ea, stride; uint64_t n, ticks, rep, seq, strd; } spu_dgqs_k;
+static __thread struct {
+    unsigned long long t0ms, nflush, nget, by_n[SPU_DGQ_MAX + 1], by_dt[40];
+    uintptr_t ra[32]; unsigned long long ra_n[32];
+    spu_dgqs_k k[512];
+    uint64_t all_ticks, lost_ticks, sz_ticks[20], sz_n[20];
+} *t_dgqs;
+static int spu_dgqs_cmp(const void* a, const void* b)
+{
+    const uint64_t x = ((const spu_dgqs_k*)a)->ticks, y = ((const spu_dgqs_k*)b)->ticks;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+/* Per GET stream (image, LS address, size): copy ticks and how the EA moves (same / +size /
+ * same stride as last time). */
+static SPU_NOINLINE_COLD void spu_dgqstat_copy(spu_context* c, const spu_dgq_ent* x)
+{
+    if (!t_dgqs) return;
+    const unsigned long long a = __builtin_ia32_rdtsc();
+    memcpy(x->dst, x->src, x->size);
+    const unsigned long long dt = __builtin_ia32_rdtsc() - a;
+    t_dgqs->all_ticks += dt;
+    { int b = 31 - __builtin_clz(x->size | 1); if (b > 19) b = 19; t_dgqs->sz_ticks[b] += dt; t_dgqs->sz_n[b]++; }
+    const uint32_t img = (uint32_t)c->image_id, lsa = (uint32_t)(x->dst - c->ls) & SPU_LS_MASK;
+    uint32_t h = (lsa * 2654435761u) ^ (x->size * 40503u) ^ (img << 24);
+    for (uint32_t i = 0; i < 16; i++) {
+        spu_dgqs_k* const e = &t_dgqs->k[(h + i) & 511];
+        if (!e->n) { e->img = img; e->lsa = lsa; e->size = x->size; e->last_ea = x->ea - x->size; e->stride = x->size; }
+        else if (e->img != img || e->lsa != lsa || e->size != x->size) continue;
+        const uint32_t d = x->ea - e->last_ea;
+        e->rep += d == 0; e->seq += d == x->size; e->strd += d == e->stride;
+        e->stride = d; e->last_ea = x->ea; e->n++; e->ticks += dt;
+        return;
+    }
+    t_dgqs->lost_ticks += dt;
+}
+extern unsigned long long ps3_ms_now(void);
+static SPU_NOINLINE_COLD void spu_dgqstat_note(uint32_t n, uintptr_t ra)
+{
+    if (!t_dgqs) { t_dgqs = calloc(1, sizeof *t_dgqs); if (!t_dgqs) return; t_dgqs->t0ms = ps3_ms_now(); }
+    const unsigned long long dt = __builtin_ia32_rdtsc() - t_dgq_t0;
+    t_dgqs->nflush++; t_dgqs->nget += n; t_dgqs->by_n[n]++;
+    { int b = 63 - __builtin_clzll(dt | 1); if (b > 39) b = 39; t_dgqs->by_dt[b]++; }
+    for (int i = 0; i < 32; i++) {
+        if (t_dgqs->ra[i] == ra) { t_dgqs->ra_n[i]++; break; }
+        if (!t_dgqs->ra[i]) { t_dgqs->ra[i] = ra; t_dgqs->ra_n[i] = 1; break; }
+    }
+    const unsigned long long now = ps3_ms_now();
+    if (now - t_dgqs->t0ms < 10000) return;
+    const double s = (now - t_dgqs->t0ms) / 1000.0;
+    char name[32] = "?";
+#ifdef __linux__
+    prctl(PR_GET_NAME, name, 0, 0, 0);
+#endif
+    spu_lockline_lock();
+    fprintf(stderr, "[dgqstat] %llu ms thread '%s': %.0f flushes/s, %.0f GETs/s, %.2f GETs/flush\n[dgqstat]   n:",
+            now, name, t_dgqs->nflush / s, t_dgqs->nget / s, (double)t_dgqs->nget / (double)(t_dgqs->nflush | !t_dgqs->nflush));
+    for (int i = 1; i <= SPU_DGQ_MAX; i++) if (t_dgqs->by_n[i]) fprintf(stderr, " %d:%.1f%%", i, 100.0 * t_dgqs->by_n[i] / t_dgqs->nflush);
+    fprintf(stderr, "\n[dgqstat]   tsc log2:");
+    for (int i = 0; i < 40; i++) if (t_dgqs->by_dt[i]) fprintf(stderr, " %d:%.1f%%", i, 100.0 * t_dgqs->by_dt[i] / t_dgqs->nflush);
+    fputc('\n', stderr);
+    for (int i = 0; i < 32 && t_dgqs->ra[i]; i++)
+        fprintf(stderr, "[dgqstat]   ra spu_halt%+lld: %.1f%%\n", (long long)(t_dgqs->ra[i] - (uintptr_t)&spu_halt),
+                100.0 * t_dgqs->ra_n[i] / t_dgqs->nflush);
+    { uint64_t tot = 0; for (int i = 0; i < 512; i++) tot += t_dgqs->k[i].ticks;
+      qsort(t_dgqs->k, 512, sizeof t_dgqs->k[0], spu_dgqs_cmp);
+      fprintf(stderr, "[dgqstat]   copy ticks %.1f M/s (streams below %.1f, untracked %.1f); by size log2 (M ticks/s, ticks each):",
+              t_dgqs->all_ticks / s / 1e6, tot / s / 1e6, t_dgqs->lost_ticks / s / 1e6);
+      for (int b = 0; b < 20; b++) if (t_dgqs->sz_n[b])
+          fprintf(stderr, " %d:%.1f/%.0f", b, t_dgqs->sz_ticks[b] / s / 1e6, (double)t_dgqs->sz_ticks[b] / t_dgqs->sz_n[b]);
+      fputc('\n', stderr);
+      for (int i = 0; i < 20 && t_dgqs->k[i].n; i++) {
+          const spu_dgqs_k* const e = &t_dgqs->k[i];
+          fprintf(stderr, "[dgqstat]   img %2u lsa 0x%05X size %5u: %.1f%% ticks, %.0f/s, %.0f ticks each; ea same %.0f%% +size %.0f%% same-stride %.0f%%\n",
+                  e->img, e->lsa, e->size, 100.0 * e->ticks / (tot | !tot), e->n / s, (double)e->ticks / e->n,
+                  100.0 * e->rep / e->n, 100.0 * e->seq / e->n, 100.0 * e->strd / e->n);
+      } }
+    spu_lockline_unlock();
+    memset(t_dgqs, 0, sizeof *t_dgqs);
+    t_dgqs->t0ms = now;
+}
+static __attribute__((noinline)) void spu_dgq_flush_slow(void)
+{
+    spu_context* const c = t_dgq.ctx;
+    const uint32_t n = t_dgq.n, h = t_dgq.h;
+    t_dgq.n = 0; t_dgq.h = 0;
+    if (__builtin_expect(s_dgqstat, 0)) spu_dgqstat_note(n, (uintptr_t)__builtin_return_address(0));
+    for (uint32_t i = 0; i < n; i++) {
+        const spu_dgq_ent* const x = &t_dgq.e[(h + i) & (SPU_DGQ_MAX - 1)];
+        if (__builtin_expect(s_dgqstat, 0)) spu_dgqstat_copy(c, x); else
+        memcpy(x->dst, x->src, x->size);
+        spu_overlay_note_get(c, x->ea, x->dst, x->size);
+    }
+}
+static inline void spu_dgq_flush(void)
+{
+    if (__builtin_expect(t_dgq.n != 0, 0)) spu_dgq_flush_slow();
+}
+
 void spu_halt(spu_context* ctx)
 {
+    spu_dgq_flush();
     /* Register/context dump at halt-asserts: the WWS job's parameter guard
      * (heqi 0x1650 in job_wws_7BD900) checks (r12 bit0) & (r9 16-aligned) &
      * (r15 != 0) -- job descriptor/ABI values our execute path must supply.
@@ -233,6 +358,7 @@ void spu_stop(spu_context* ctx)
      * A/B experiments (it makes the kernel terminate, which the game restarts). */
     static int s_halt = -1;
     if (s_halt < 0) s_halt = getenv("YDKJ_STOP_HALT") ? 1 : 0;
+    spu_dgq_flush();
     ctx->status = SPU_STATUS_STOPPED_BY_STOP;
     if (s_halt) spu_halt(ctx);
 }
@@ -307,6 +433,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
     const uint64_t fpcr_outer = spu_float_mode_enter();   /* not modified after setjmp */
     int halted = 0;
+    spu_dgq_flush();   /* an outer run's queued GETs (nested run on this thread) */
     /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
      * with r3/r4 zeroed in SOME runs while the jm2 runner sets them -- count
      * and stamp every image-1 run here to find the argless caller. */
@@ -380,6 +507,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
               fflush(stderr); } }
         SPU_DRAIN(ctx);
     }
+    spu_dgq_flush();
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
@@ -1080,6 +1208,122 @@ static inline int spu_mfc_lean_on(void)
     return __builtin_expect(on > 0, 1) || (on < 0 && spu_mfc_lean_settle());
 }
 
+int g_spu_dmastat = -1;
+extern unsigned long long ps3_ms_now(void);
+typedef struct { uint32_t img, lsa, size, put_path, pc; uint64_t bytes, n; } spu_dmastat_ent;
+#define SPU_DMASTAT_N 1024
+static __thread struct {
+    spu_dmastat_ent e[SPU_DMASTAT_N];
+    uint64_t bytes[2][2], n[2][2], other_b, hist[2][16];
+    unsigned long long t0;
+} *t_dmastat;
+static int spu_dmastat_cmp(const void* a, const void* b)
+{
+    const spu_dmastat_ent *x = a, *y = b;
+    return x->bytes < y->bytes ? 1 : x->bytes > y->bytes ? -1 : 0;
+}
+SPU_NOINLINE_COLD void spu_dmastat_note(spu_context* spu, uint32_t cmd, uint32_t lsa, uint32_t ea,
+                                        uint32_t size, int path)
+{
+    if (g_spu_dmastat < 0) {
+        const char* e = getenv("SPU_DMASTAT");
+        g_spu_dmastat = (e && *e && *e != '0') ? 1 : 0;
+        if (!g_spu_dmastat) return;
+    }
+    if (!t_dmastat) { t_dmastat = calloc(1, sizeof *t_dmastat); if (!t_dmastat) return;
+                      t_dmastat->t0 = ps3_ms_now(); }
+    const int put = !(cmd & 0x40);
+    t_dmastat->bytes[put][path] += size; t_dmastat->n[put][path]++;
+    { int b = 31 - __builtin_clz(size | 1); if (b > 15) b = 15; t_dmastat->hist[put][b] += size; }
+    const uint32_t img = (uint32_t)spu->image_id, pp = (uint32_t)(put | (path << 1));
+    lsa &= SPU_LS_MASK;
+    uint32_t h = (lsa * 2654435761u) ^ (size * 40503u) ^ (img << 24) ^ pp;
+    for (uint32_t i = 0; i < 16; i++) {
+        spu_dmastat_ent* x = &t_dmastat->e[(h + i) & (SPU_DMASTAT_N - 1)];
+        if (!x->n) { x->img = img; x->lsa = lsa; x->size = size; x->put_path = pp;
+                     x->pc = (uint32_t)spu->pc & SPU_LS_MASK; }
+        else if (x->img != img || x->lsa != lsa || x->size != size || x->put_path != pp) continue;
+        x->bytes += size; x->n++; x->pc = (uint32_t)spu->pc & SPU_LS_MASK; (void)ea;
+        goto counted;
+    }
+    t_dmastat->other_b += size;
+counted:;
+    const unsigned long long now = ps3_ms_now();
+    if (now - t_dmastat->t0 < 10000) return;
+    const double s = (now - t_dmastat->t0) / 1000.0;
+    char name[32] = "?";
+#ifdef __linux__
+    prctl(PR_GET_NAME, name, 0, 0, 0);   /* 16 bytes */
+#endif
+    static spu_dmastat_ent tmp[SPU_DMASTAT_N];   /* one dumper at a time (lockline lock) */
+    spu_lockline_lock();
+    fprintf(stderr, "[dmastat] %llu ms thread '%s' %.1f s: GET fast %.0f B/s (%.0f/s) slow %.0f B/s (%.0f/s);"
+            " PUT fast %.0f B/s (%.0f/s) slow %.0f B/s (%.0f/s); untracked %.0f B/s\n", now, name, s,
+            t_dmastat->bytes[0][0] / s, t_dmastat->n[0][0] / s, t_dmastat->bytes[0][1] / s, t_dmastat->n[0][1] / s,
+            t_dmastat->bytes[1][0] / s, t_dmastat->n[1][0] / s, t_dmastat->bytes[1][1] / s, t_dmastat->n[1][1] / s,
+            t_dmastat->other_b / s);
+    for (int d = 0; d < 2; d++) {
+        fprintf(stderr, "[dmastat]   %s bytes by size log2:", d ? "PUT" : "GET");
+        for (int b = 0; b < 16; b++) if (t_dmastat->hist[d][b]) fprintf(stderr, " %d:%.0f", b, t_dmastat->hist[d][b] / s);
+        fputc('\n', stderr);
+    }
+    memcpy(tmp, t_dmastat->e, sizeof tmp);
+    qsort(tmp, SPU_DMASTAT_N, sizeof tmp[0], spu_dmastat_cmp);
+    for (int i = 0; i < 25 && tmp[i].n; i++)
+        fprintf(stderr, "[dmastat]   img %2u %s %s lsa 0x%05X size %5u last pc 0x%05X: %.0f B/s, %.0f/s\n",
+                tmp[i].img, (tmp[i].put_path & 1) ? "PUT" : "GET", (tmp[i].put_path & 2) ? "slow" : "fast",
+                tmp[i].lsa, tmp[i].size, tmp[i].pc, tmp[i].bytes / s, tmp[i].n / s);
+    spu_lockline_unlock();
+    memset(t_dmastat, 0, sizeof *t_dmastat);
+    t_dmastat->t0 = now;
+}
+
+static SPU_NOINLINE_COLD int spu_dma_defer_settle(void)
+{
+    const char* e = getenv("SPU_DMA_DEFER");
+    const int on = e && e[0] == '1';
+    if (on) fprintf(stderr, "[spu] SPU_DMA_DEFER=1: lean-path GETs copied at the next channel operation\n");
+    { const char* d = getenv("SPU_DGQSTAT"); s_dgqstat = on && d && *d && *d != '0'; }
+    { const char* r = getenv("SPU_DGQ_RING"); s_dgq_ring = r && r[0] == '1'; }
+    s_dma_defer = on;
+    return on;
+}
+static inline int spu_dma_defer_on(void)
+{
+    const int on = s_dma_defer;
+    return on > 0 || (on < 0 && spu_dma_defer_settle());
+}
+
+static inline void spu_dgq_push_inline(spu_context* ctx, uint8_t* dst, const uint8_t* src,
+                                       uint32_t size, uint32_t ea)
+{
+    if (t_dgq.n && (t_dgq.ctx != ctx || t_dgq.n == SPU_DGQ_MAX)) {
+        if (t_dgq.ctx == ctx && s_dgq_ring) {
+            const spu_dgq_ent* const o = &t_dgq.e[t_dgq.h];
+            t_dgq.h = (t_dgq.h + 1) & (SPU_DGQ_MAX - 1); t_dgq.n--;
+            memcpy(o->dst, o->src, o->size);
+            spu_overlay_note_get(ctx, o->ea, o->dst, o->size);
+        } else {
+            spu_dgq_flush_slow();
+        }
+    }
+    const uint32_t pf = size < 2048u ? size : 2048u;
+    for (uint32_t o = 0; o < pf; o += 64u) __builtin_prefetch(src + o, 0, 3);
+    __builtin_prefetch(src + size - 1u, 0, 3);
+    if (__builtin_expect(s_dgqstat, 0) && !t_dgq.n) t_dgq_t0 = __builtin_ia32_rdtsc();
+    spu_dgq_ent* const x = &t_dgq.e[(t_dgq.h + t_dgq.n++) & (SPU_DGQ_MAX - 1)];
+    x->dst = dst; x->src = src; x->size = size; x->ea = ea;
+    t_dgq.ctx = ctx;
+}
+/* The slow path's (mfc_do_transfer, list elements included) entry, see spu_dma.h. */
+int spu_dgq_push(spu_context* ctx, uint8_t* dst, const uint8_t* src, uint32_t size, uint32_t ea)
+{
+    if (!spu_dma_defer_on() || ctx->ls != ctx->ls_store) return 0;
+    spu_dgq_push_inline(ctx, dst, src, size, ea);
+    return 1;
+}
+void spu_dgq_flush_all(void) { spu_dgq_flush(); }
+
 static SPU_NOINLINE_COLD void spu_wrch_mfc_slow(spu_context* ctx, uint32_t channel, uint32_t v)
 {
     u128 value;
@@ -1134,14 +1378,20 @@ void spu_wrch_mfc_cmd(spu_context* ctx, uint32_t cmd)
               t->last_ea = ea; t->last_lsa = lsa; t->rep = 0; t->since = 0;
           } }
 
+        SPU_DMASTAT(ctx, cmd, lsa, ea, size, 0);
         mfc_engine* const mfc = mfc_for(ctx);
         mfc->tag_completed &= ~bit;
         uint8_t* const ls_ptr = &ctx->ls[lsm];
         uint8_t* const ea_ptr = vm_base + ea;
         if (!is_put) {
-            memcpy(ls_ptr, ea_ptr, size);
-            spu_overlay_note_get(ctx, ea, ls_ptr, size);
+            if (__builtin_expect(s_dma_defer, 0) && spu_dma_defer_on() && ctx->ls == ctx->ls_store) {
+                spu_dgq_push_inline(ctx, ls_ptr, ea_ptr, size, ea);
+            } else {
+                memcpy(ls_ptr, ea_ptr, size);
+                spu_overlay_note_get(ctx, ea, ls_ptr, size);
+            }
         } else {
+            spu_dgq_flush();
             mfc_put_copy(ctx, ea, ls_ptr, ea_ptr, size);
             if (g_spu_put_hook) g_spu_put_hook(ea, size);
         }
@@ -1156,6 +1406,7 @@ slow:
  * the mask now. An update that would raise the tag-status event takes spu_wrch. */
 void spu_wrch_mfc_tag_update(spu_context* ctx, uint32_t v)
 {
+    spu_dgq_flush();
     if (!spu_mfc_lean_on() || (v != 0 && (ctx->event_mask & 0x1u))) {
         spu_wrch_mfc_slow(ctx, MFC_WrTagUpdate, v);
         return;
@@ -1193,6 +1444,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
     default: break;
     }
+    spu_dgq_flush();
 
     if (channel_is_mfc(channel)) {
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
@@ -1442,6 +1694,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * 16-byte store instead of the rax:rdx halves a u128 return comes back in. */
 uint32_t spu_rdch_u32(spu_context* ctx, uint32_t channel)
 {
+    spu_dgq_flush();
     spu_honour_stop_request(ctx);
     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
@@ -1543,6 +1796,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
  * ===========================================================================*/
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
 {
+    spu_dgq_flush();
     spu_honour_stop_request(ctx);
     /* SPU_WHOPOLLS=<n>: rchcnt/park accounting PER SPU, printed every n calls
      * with the pc each SPU is sitting at.
