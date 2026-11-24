@@ -138,6 +138,16 @@ void cellSysutilQueueEvent(int slot, u32 status, u32 param);
 void ps3_host_quit(const char* why);
 int  ps3_host_quitting(void);
 
+/* End the process with `code`: sys_process_exit, the end of a host quit, or
+ * a host whose entry function returned. Prints the code and why on stderr,
+ * runs the host's g_ps3_pre_exit hook if it set one, flushes stdio, then
+ * exit(code). The hook is where a host stops the threads that are still in
+ * the GPU driver: exit() runs the driver's library destructors, which unmap
+ * its code under a render thread that keeps drawing. A second caller, from
+ * any other thread, parks instead: exit() runs once. */
+extern void (*g_ps3_pre_exit)(int code);
+void ps3_host_exit(int code, const char* why);
+
 /* value_ea / buf_ea are GUEST addresses, not host pointers: both write into
  * the title's own memory through vm_write*. Spelt u32 so a caller cannot
  * translate the argument first and hand over a host address. */

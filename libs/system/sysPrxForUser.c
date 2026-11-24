@@ -7,6 +7,7 @@
  */
 
 #include "sysPrxForUser.h"
+#include "cellSysutil.h"                    /* ps3_host_exit */
 #include "../../runtime/memory/vm.h"
 #include <ps3emu/guest_call.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
@@ -196,7 +197,7 @@ void sys_process_exit(s32 exitcode)
 #endif
         }
     }
-    exit(exitcode);
+    ps3_host_exit(exitcode, "sys_process_exit");   /* cellSysutil.c: stops the host's GPU threads first */
 }
 
 s32 sys_process_getpid(void)

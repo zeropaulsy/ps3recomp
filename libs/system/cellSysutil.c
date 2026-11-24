@@ -770,8 +770,7 @@ static void* host_quit_thread(void* unused)
     }
     printf("[quit] the game did not exit on its own; ending it (save in flight: %s, waited %d ms) -> exit 0\n",
            ps3_savedata_busy() ? "yes, gave up" : "no", waited);
-    fflush(NULL);
-    exit(0);
+    ps3_host_exit(0, "host quit, the game did not exit on its own");
 #ifdef _WIN32
     return 0;
 #else
@@ -795,6 +794,27 @@ void ps3_host_quit(const char* why)
     pthread_t th;
     if (pthread_create(&th, NULL, host_quit_thread, NULL) == 0) { pthread_detach(th); return; }
 #endif
+    ps3_host_exit(0, "host quit, no thread to wait for the game on");
+}
+
+void (*g_ps3_pre_exit)(int code) = NULL;
+
+void ps3_host_exit(int code, const char* why)
+{
+    static volatile int s_exiting;
+    if (__atomic_exchange_n(&s_exiting, 1, __ATOMIC_ACQ_REL)) {
+        for (;;) {               /* another thread is already in exit() */
+#ifdef _WIN32
+            Sleep(1000);
+#else
+            pause();
+#endif
+        }
+    }
+    fflush(stdout);
+    fprintf(stderr, "[exit] %s: exit code %d\n", why ? why : "host", code);
+    fflush(stderr);
+    if (g_ps3_pre_exit) g_ps3_pre_exit(code);
     fflush(NULL);
-    exit(0);
+    exit(code);
 }
