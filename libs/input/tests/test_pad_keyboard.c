@@ -2,7 +2,10 @@
  * plugged in the keyboard plays the pad -- arrows = d-pad, Z/X/A/S = cross/
  * circle/square/triangle, Q/W = L1/R1, 1/2 = L2/R2, Return = START, Tab =
  * SELECT, the left stick mirrors the d-pad -- while a window of the process has
- * the keyboard focus, and releases everything when it loses it.
+ * the keyboard focus, and releases everything when it loses it. Then the same
+ * with PAD_KEYBOARD=full: W A S D / I J K L = left / right stick, arrows = d-pad
+ * only, Space/E/Q/R = cross/circle/square/triangle (Esc = circle too), Left Ctrl/Shift = L1/R1,
+ * Z/C = L2/R2, F/H = L3/R3, Return = START (not with Alt), Tab = SELECT.
  *
  *   clang -std=gnu17 -DPS3RECOMP_PAD_KEYBOARD_SDL -I include $(sdl2-config --cflags) \
  *         -I "$(sdl2-config --prefix)/include" libs/input/tests/test_pad_keyboard.c \
@@ -59,6 +62,10 @@ static unsigned data_word(int offset)
     return (unsigned)b[0] << 8 | b[1];
 }
 #define D1() data_word(CELL_PAD_BTN_OFFSET_DIGITAL1)
+#define LX() data_word(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X)
+#define LY() data_word(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y)
+#define RX() data_word(CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X)
+#define RY() data_word(CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y)
 #define D2() data_word(CELL_PAD_BTN_OFFSET_DIGITAL2)
 static void keys(int a, int b, int c)
 {
@@ -69,6 +76,8 @@ static void keys(int a, int b, int c)
 }
 /* DIGITAL1 / DIGITAL2 bits */
 #define SELECT 0x01u
+#define L3     0x02u
+#define R3     0x04u
 #define START  0x08u
 #define UP     0x10u
 #define RIGHT  0x20u
@@ -137,6 +146,65 @@ int main(void)
     assert(data_word(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X) == 128);
     s_focus = 1;
     assert(D2() == CROSS);
+
+    assert(cellPadEnd() == CELL_OK);
+
+    /* ---- PAD_KEYBOARD=full ---- */
+    setenv("PAD_KEYBOARD", "full", 1);
+    assert(cellPadInit(4) == CELL_OK);
+    keys(0, 0, 0);
+    assert(D1() == 0 && D2() == 0);
+    assert(LX() == 128 && LY() == 128 && RX() == 128 && RY() == 128);
+
+    static const struct { int key; unsigned d1, d2; } fl[] = {
+        { SDL_SCANCODE_SPACE, 0, CROSS },  { SDL_SCANCODE_E, 0, CIRCLE },
+        { SDL_SCANCODE_ESCAPE, 0, CIRCLE },
+        { SDL_SCANCODE_Q, 0, SQUARE },     { SDL_SCANCODE_R, 0, TRI },
+        { SDL_SCANCODE_LCTRL, 0, L1 },     { SDL_SCANCODE_LSHIFT, 0, R1 },
+        { SDL_SCANCODE_Z, 0, L2 },         { SDL_SCANCODE_C, 0, R2 },
+        { SDL_SCANCODE_F, L3, 0 },         { SDL_SCANCODE_H, R3, 0 },
+        { SDL_SCANCODE_RETURN, START, 0 }, { SDL_SCANCODE_TAB, SELECT, 0 },
+        { SDL_SCANCODE_UP, UP, 0 },        { SDL_SCANCODE_DOWN, DOWN, 0 },
+        { SDL_SCANCODE_LEFT, LEFT, 0 },    { SDL_SCANCODE_RIGHT, RIGHT, 0 },
+    };
+    for (unsigned i = 0; i < sizeof fl / sizeof fl[0]; i++) {
+        keys(fl[i].key, 0, 0);
+        assert(D1() == fl[i].d1 && D2() == fl[i].d2);
+        /* The d-pad no longer moves the stick. */
+        assert(LX() == 128 && LY() == 128);
+    }
+    /* The old keys are free: W/A/S/X press nothing. */
+    keys(SDL_SCANCODE_X, SDL_SCANCODE_1, 0);
+    assert(D1() == 0 && D2() == 0);
+
+    /* Sticks: one key = full deflection, both keys of an axis = centred. */
+    keys(SDL_SCANCODE_A, SDL_SCANCODE_W, 0);
+    assert(D1() == 0 && D2() == 0);
+    assert(LX() == 0 && LY() == 0 && RX() == 128 && RY() == 128);
+    keys(SDL_SCANCODE_D, SDL_SCANCODE_S, 0);
+    assert(LX() == 255 && LY() == 255);
+    keys(SDL_SCANCODE_A, SDL_SCANCODE_D, 0);
+    assert(LX() == 128);
+    keys(SDL_SCANCODE_J, SDL_SCANCODE_I, 0);
+    assert(RX() == 0 && RY() == 0 && LX() == 128 && LY() == 128);
+    keys(SDL_SCANCODE_L, SDL_SCANCODE_K, 0);
+    assert(RX() == 255 && RY() == 255);
+
+    /* Walking while jumping and grabbing. */
+    keys(SDL_SCANCODE_D, SDL_SCANCODE_SPACE, SDL_SCANCODE_LSHIFT);
+    assert(D2() == (CROSS | R1) && LX() == 255);
+
+    /* Alt+Return is the window's fullscreen toggle, not START. */
+    keys(SDL_SCANCODE_LALT, SDL_SCANCODE_RETURN, 0);
+    assert(D1() == 0);
+
+    /* Focus loss still releases everything, sticks included. */
+    keys(SDL_SCANCODE_D, SDL_SCANCODE_L, SDL_SCANCODE_SPACE);
+    s_focus = 0;
+    assert(D1() == 0 && D2() == 0);
+    assert(LX() == 128 && RX() == 128);
+    s_focus = 1;
+    assert(D2() == CROSS && LX() == 255 && RX() == 255);
 
     assert(cellPadEnd() == CELL_OK);
     printf("test_pad_keyboard: ok\n");

@@ -237,6 +237,21 @@ static int pad_key_down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0;
 #define PADKEY_2 '2'
 #define PADKEY_RETURN VK_RETURN
 #define PADKEY_TAB VK_TAB
+#define PADKEY_D 'D'
+#define PADKEY_E 'E'
+#define PADKEY_R 'R'
+#define PADKEY_C 'C'
+#define PADKEY_F 'F'
+#define PADKEY_H 'H'
+#define PADKEY_I 'I'
+#define PADKEY_J 'J'
+#define PADKEY_K 'K'
+#define PADKEY_L 'L'
+#define PADKEY_SPACE VK_SPACE
+#define PADKEY_LSHIFT VK_LSHIFT
+#define PADKEY_LCTRL VK_LCONTROL
+#define PADKEY_LALT VK_LMENU
+#define PADKEY_ESCAPE VK_ESCAPE
 #elif defined(__APPLE__) && !defined(PS3RECOMP_PAD_KEYBOARD_SDL)
 /* macOS: virtual key codes (Carbon HIToolbox/Events.h kVK_*), polled with CGEventSourceKeyState,
  * which needs no event tap and no window. "Focused" is NSApplication.isActive of this process,
@@ -273,6 +288,21 @@ static int pad_key_down(int key)
 #define PADKEY_2 19
 #define PADKEY_RETURN 36
 #define PADKEY_TAB 48
+#define PADKEY_D 2
+#define PADKEY_E 14
+#define PADKEY_R 15
+#define PADKEY_C 8
+#define PADKEY_F 3
+#define PADKEY_H 4
+#define PADKEY_I 34
+#define PADKEY_J 38
+#define PADKEY_K 40
+#define PADKEY_L 37
+#define PADKEY_SPACE 49
+#define PADKEY_LSHIFT 56
+#define PADKEY_LCTRL 59
+#define PADKEY_LALT 58
+#define PADKEY_ESCAPE 53
 #elif PAD_BACKEND_SDL2
 /* Everywhere else the keyboard is SDL's: scancodes are physical keys, like the macOS codes above. The state is kept
  * current by whoever pumps SDL's events (the window of the RSX backend); without a video subsystem nothing is ever
@@ -299,25 +329,74 @@ static int pad_key_down(int key)
 #define PADKEY_2 SDL_SCANCODE_2
 #define PADKEY_RETURN SDL_SCANCODE_RETURN
 #define PADKEY_TAB SDL_SCANCODE_TAB
+#define PADKEY_D SDL_SCANCODE_D
+#define PADKEY_E SDL_SCANCODE_E
+#define PADKEY_R SDL_SCANCODE_R
+#define PADKEY_C SDL_SCANCODE_C
+#define PADKEY_F SDL_SCANCODE_F
+#define PADKEY_H SDL_SCANCODE_H
+#define PADKEY_I SDL_SCANCODE_I
+#define PADKEY_J SDL_SCANCODE_J
+#define PADKEY_K SDL_SCANCODE_K
+#define PADKEY_L SDL_SCANCODE_L
+#define PADKEY_SPACE SDL_SCANCODE_SPACE
+#define PADKEY_LSHIFT SDL_SCANCODE_LSHIFT
+#define PADKEY_LCTRL SDL_SCANCODE_LCTRL
+#define PADKEY_LALT SDL_SCANCODE_LALT
+#define PADKEY_ESCAPE SDL_SCANCODE_ESCAPE
 #endif
 
-static void pad_poll_keyboard(void)
+/* PAD_KEYBOARD=full (read at cellPadInit): every control of the pad on a key of
+ * its own, for titles that use the whole pad. The default layout above drives the
+ * d-pad and the left stick from the same arrows and has no right stick; in a game
+ * where the d-pad does something else (LittleBigPlanet's emotes) walking then
+ * also presses it.
+ *
+ *   W A S D = left stick        I J K L = right stick     arrows = d-pad
+ *   Space = cross   E or Esc = circle ("back")   Q = square   R = triangle
+ *   Left Ctrl = L1  Left Shift = R1   Z = L2   C = R2   F = L3   H = R3
+ *   Enter = START (not with Alt: Alt+Enter is the window's fullscreen key)
+ *   Tab = SELECT
+ *
+ * A stick axis is full deflection while one of its two keys is down and centred
+ * with neither or both. Esc doubles as circle because that is "back" in most
+ * menus; the window's own Esc-quits shortcut is turned off with
+ * PS3RECOMP_ESC_QUIT=0 (Vulkan backend) when this layout is used. */
+static int s_kb_full;
+
+static u8 pad_key_axis(int neg, int pos)
 {
-    static int off = -1;
-    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
-    if (off) return;
+    const int n = pad_key_down(neg), p = pad_key_down(pos);
+    return (u8)(n == p ? 128 : n ? 0 : 255);
+}
 
-    PadHostState* hs = &s_host_state[0];
-    if (!pad_host_window_focused()) {
-        /* Release everything on focus loss, or a key held while alt-tabbing
-         * would stay down forever. */
-        hs->buttons = 0;
-        hs->analog_lx = hs->analog_ly = 128;
-        hs->analog_rx = hs->analog_ry = 128;
-        hs->connected = 1;
-        return;
-    }
+static u16 pad_keys_full(PadHostState* hs)
+{
+    static const struct { int vk; u16 btn; } map[] = {
+        { PADKEY_UP,     CELL_PAD_CTRL_UP },       { PADKEY_DOWN,   CELL_PAD_CTRL_DOWN },
+        { PADKEY_LEFT,   CELL_PAD_CTRL_LEFT },     { PADKEY_RIGHT,  CELL_PAD_CTRL_RIGHT },
+        { PADKEY_SPACE,  CELL_PAD_CTRL_CROSS },    { PADKEY_E,      CELL_PAD_CTRL_CIRCLE },
+        { PADKEY_Q,      CELL_PAD_CTRL_SQUARE },   { PADKEY_R,      CELL_PAD_CTRL_TRIANGLE },
+        { PADKEY_LCTRL,  CELL_PAD_CTRL_L1 },       { PADKEY_LSHIFT, CELL_PAD_CTRL_R1 },
+        { PADKEY_Z,      CELL_PAD_CTRL_L2 },       { PADKEY_C,      CELL_PAD_CTRL_R2 },
+        { PADKEY_F,      CELL_PAD_CTRL_L3 },       { PADKEY_H,      CELL_PAD_CTRL_R3 },
+        { PADKEY_RETURN, CELL_PAD_CTRL_START },    { PADKEY_TAB,    CELL_PAD_CTRL_SELECT },
+        { PADKEY_ESCAPE, CELL_PAD_CTRL_CIRCLE },
+    };
+    u16 btns = 0;
+    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+        if (pad_key_down(map[i].vk)) btns |= map[i].btn;
+    if (pad_key_down(PADKEY_LALT)) btns &= (u16)~CELL_PAD_CTRL_START;
 
+    hs->analog_lx = pad_key_axis(PADKEY_A, PADKEY_D);
+    hs->analog_ly = pad_key_axis(PADKEY_W, PADKEY_S);
+    hs->analog_rx = pad_key_axis(PADKEY_J, PADKEY_L);
+    hs->analog_ry = pad_key_axis(PADKEY_I, PADKEY_K);
+    return btns;
+}
+
+static u16 pad_keys_default(PadHostState* hs)
+{
     static const struct { int vk; u16 btn; } map[] = {
         { PADKEY_UP,     CELL_PAD_CTRL_UP },      { PADKEY_DOWN,  CELL_PAD_CTRL_DOWN },
         { PADKEY_LEFT,   CELL_PAD_CTRL_LEFT },    { PADKEY_RIGHT, CELL_PAD_CTRL_RIGHT },
@@ -332,19 +411,42 @@ static void pad_poll_keyboard(void)
     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
         if (pad_key_down(map[i].vk)) btns |= map[i].btn;
 
-    hs->buttons   = btns;
-    hs->connected = 1;
     hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
                          (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
     hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
                          (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
     hs->analog_rx = hs->analog_ry = 128;
+    return btns;
+}
+
+static void pad_poll_keyboard(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+    if (off) return;
+
+    PadHostState* hs = &s_host_state[0];
+    if (!pad_host_window_focused()) {
+        /* Release everything on focus loss, or a key held while alt-tabbing
+         * would stay down forever. */
+        hs->buttons = 0;
+        hs->analog_lx = hs->analog_ly = 128;
+        hs->analog_rx = hs->analog_ry = 128;
+        hs->trigger_l2 = hs->trigger_r2 = 0;
+        hs->connected = 1;
+        return;
+    }
+
+    const u16 btns = s_kb_full ? pad_keys_full(hs) : pad_keys_default(hs);
+    hs->buttons   = btns;
+    hs->connected = 1;
     hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
     hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
 
     { static int said = 0;
       if (!said && btns) { said = 1;
-          printf("[cellPad] keyboard fallback active on port 0 (no controller)\n");
+          printf("[cellPad] keyboard fallback active on port 0 (no controller, %s layout)\n",
+                 s_kb_full ? "full" : "default");
           fflush(stdout); } }
 }
 
@@ -818,6 +920,7 @@ s32 cellPadInit(u32 max_connect)
 
     s_pad_initialized = 1;
     s_max_connect = max_connect > CELL_PAD_MAX_PORT_NUM ? CELL_PAD_MAX_PORT_NUM : max_connect;
+    { const char* e = getenv("PAD_KEYBOARD"); s_kb_full = e && !strcmp(e, "full"); }
     memset(s_port_setting, 0, sizeof(s_port_setting));
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
         pad_host_release(&s_host_state[i]);

@@ -5298,10 +5298,15 @@ int rsx_vulkan_backend_pump_messages(void)
 {
     if (!s_vk.windowed) return 0;
     int quit = 0;
+    /* PS3RECOMP_ESC_QUIT=0: Esc does not close the game (a keyboard layout that
+     * uses Esc as a pad button, cellPad's PAD_KEYBOARD=full); closing the
+     * window still does. */
+    static int esc_quit = -1;
+    if (esc_quit < 0) { const char* q = getenv("PS3RECOMP_ESC_QUIT"); esc_quit = !(q && q[0] == '0'); }
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) quit = 1;
-        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
+        else if (esc_quit && e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
         else if (e.type == SDL_KEYDOWN && !e.key.repeat && s_vk.window &&
                  (e.key.keysym.sym == SDLK_F11 ||
                   (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
