@@ -683,8 +683,33 @@ static void* audio_mix_thread_func(void* arg)
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
-    unsigned long blocks = 0; float peak = 0.0f;
+    /* Pace to the device clock, as the Windows loop above does. This loop used
+     * to mix a block and then sleep 2 or 5 ms; a block is 5.33 ms of sound, so
+     * it mixed a few percent faster than real time, and SDL queues without
+     * bound: the surplus piled up as latency (LBP2 with sound: ~3 s behind the
+     * picture after a minute or two, growing), and the guest's audio clock --
+     * the notify events -- ran fast with it. Now a block is mixed only when the
+     * device queue is under four blocks (~21 ms). With no device, pace on the
+     * monotonic clock. */
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    unsigned long long blocks = 0;
+    unsigned long pk_blocks = 0; float peak = 0.0f;
     while (s_mix_thread_running) {
+        const int room = audio_backend_room();
+        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
+        if (room < 0) {
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            const long long el_ns = (long long)(now.tv_sec - t0.tv_sec) * 1000000000LL + (now.tv_nsec - t0.tv_nsec);
+            const long long due_ns = (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * 1000000000ULL / CELL_AUDIO_SAMPLE_RATE);
+            if (el_ns < due_ns) { usleep(1000); continue; }
+            /* More than 50 ms behind (device gone, a debugger stop): drop the
+             * backlog instead of mixing it in a burst. */
+            if (el_ns - due_ns > 50000000LL) {
+                long long ns = (long long)now.tv_sec * 1000000000LL + now.tv_nsec - due_ns;
+                t0.tv_sec = (time_t)(ns / 1000000000LL); t0.tv_nsec = (long)(ns % 1000000000LL);
+            }
+        }
+        blocks++;
         audio_mix_one_block();
         audio_dump_mix();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
@@ -693,15 +718,19 @@ static void* audio_mix_thread_func(void* arg)
         { static int pk_on = -1; if (pk_on < 0) pk_on = getenv("AUDIO_PEAK") ? 1 : 0;
           if (pk_on) {
               const float pk = audio_mix_peak(); if (pk > peak) peak = pk;
-              if (++blocks % 188 == 0) { fprintf(stderr, "[audio-peak] %lu s: peak %.4f\n", blocks / 188, peak); peak = 0.0f; }
+              if (++pk_blocks % 188 == 0) { fprintf(stderr, "[audio-peak] %lu s: peak %.4f\n", pk_blocks / 188, peak); peak = 0.0f; }
           } }
-
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
-        }
+        /* AUDIO_RATE=1: blocks mixed per second and the device queue depth. */
+        { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
+          if (on) { static struct timespec r0; static unsigned n;
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            if (!r0.tv_sec) r0 = now;
+            n++;
+            const double el = (double)(now.tv_sec - r0.tv_sec) + (now.tv_nsec - r0.tv_nsec) / 1e9;
+            if (el >= 5.0) {
+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), device queue %u samples%c",
+                        n / el, audio_backend_queued_samples(), 10);
+                n = 0; r0 = now; } } }
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
