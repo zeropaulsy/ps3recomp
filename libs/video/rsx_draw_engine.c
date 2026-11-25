@@ -774,6 +774,13 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     if (!want_w) want_w = g.width;
     if (!want_h) want_h = g.height;
 
+    /* One surface per address, except that a display buffer's full-size
+     * surface is never replaced by a smaller one: LBP2's pod draws a
+     * depth-only 768x768 pass whose (unwritten) colour target A is offset 0,
+     * display buffer 0, while that buffer is on screen. Replacing the buffer's
+     * surface there made every buffer-0 present find only the small one and
+     * skip (eng_present_surface_ex): 15 of the 30 frames a second shown. The
+     * small one then gets a slot of its own beside it. */
     u32 slot = ENG_MAX_SURFACES;
     for (u32 i = 0; i < g.n_surfaces; i++)
         if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) {
@@ -785,8 +792,14 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
                 g.surfaces[i].last_use = g.frames;
                 return i;
             }
-            slot = i;
-            break;
+            int keep = 0;
+            for (u32 b = 0; b < 8 && !keep; b++) {
+                const eng_display_buffer* d = &g.display_buffers[b];
+                keep = d->valid && d->location == location && d->offset == offset &&
+                       s->w >= d->width && s->h >= d->height &&
+                       (want_w < d->width || want_h < d->height);
+            }
+            if (!keep && slot == ENG_MAX_SURFACES) slot = i;
         }
 
     /* Never destroy a usable render target because one malformed command
