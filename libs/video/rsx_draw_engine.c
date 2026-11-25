@@ -111,7 +111,10 @@ typedef struct {
     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
     int guest_dirty;        /* rendered since guest memory last got a copy   */
     u32 last_use;           /* g.frames when last bound, sampled or presented */
+    u32 xfer_gen;           /* bumped by writes outside draws (2D transfers) */
 } eng_surface;
+
+static void eng_crop_drop(u32 src_handle);
 
 typedef struct {
     u32 location, offset;
@@ -834,7 +837,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
 
     eng_surface* s = &g.surfaces[slot];
     if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
-    if (s->handle) g.be->color_target_release(g.be->user, s->handle);
+    if (s->handle) { eng_crop_drop(s->handle); g.be->color_target_release(g.be->user, s->handle); }
     s->location = location; s->offset = offset;
     s->w = want_w; s->h = want_h; s->fmt = want_fmt; s->aa_grid = aa_grid;
     s->handle = handle;
@@ -1130,6 +1133,7 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
                 eng_nonzero_pixels(rows, w * h, 4u));
     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
+    g.surfaces[slot].xfer_gen++;
 }
 
 /* ---- RSX_ENGINE_XFER_SHADOW ---------------------------------------------
@@ -1339,6 +1343,7 @@ int rsx_draw_engine_xfer_back(u32 sloc, u32 soff, u32 spitch,
         eng_surface* s = &g.surfaces[slot];
         if (s->fmt != RSX_BE_FMT_R8G8B8A8 || xb % 4u || xb / 4u + w > s->w || y + h > s->h) return 0;
         g.be->color_target_copy(g.be->user, e->img, sxb / 4u, sy, s->handle, xb / 4u, y, w, h);
+        s->xfer_gen++;
         s->guest_dirty = 1;     /* the guest bytes under it were not written */
         if (eng_xs_log())
             fprintf(stderr, "[rsx engine] xfer shadow: back %u:0x%08X %ux%u -> surface 0x%08X at %u,%u\n",
@@ -3349,6 +3354,72 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
     return ENG_INVALID;
 }
 
+/* ---- textures smaller than the surface they name -------------------------
+ * A texture's own width and height define its 0..1 coordinates. When a game
+ * renders into the top-left w x h of a bigger target and samples it as a
+ * w x h texture at the target's address (LBP2's in-level TV screens: a
+ * 640x360 texture over a 1280x720 target; its bloom chain: 320x180 over a
+ * 320x2880 one), binding the whole target maps 0..1 to the whole target and
+ * the picture shrinks into one corner. The texture gets a w x h copy of that
+ * corner instead, made in command order and kept until the target is written
+ * again. RSX_ENGINE_NO_CROP=1 binds the whole target as before. */
+#define ENG_CROP_MAX 32
+typedef struct {
+    u32 src, w, h, img, last_use, xfer_gen;
+    u64 serial;
+} eng_crop;
+static eng_crop s_crop[ENG_CROP_MAX];
+static u32 s_crop_n;
+
+/* Release the copies taken from target `src_handle`, or all of them for 0. */
+static void eng_crop_drop(u32 src_handle)
+{
+    for (u32 i = 0; i < s_crop_n;) {
+        if (src_handle && s_crop[i].src != src_handle) { i++; continue; }
+        if (g.be && g.be->color_target_release) g.be->color_target_release(g.be->user, s_crop[i].img);
+        s_crop[i] = s_crop[--s_crop_n];
+    }
+}
+
+static int eng_crop_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_ENGINE_NO_CROP"); on = !(e && *e == '1'); }
+    return on && g.be->color_target_copy && g.be->color_target_create && g.be->color_target_release;
+}
+
+/* A target holding the top-left w x h of surface `s`, current as of now; 0
+ * when there is none to give (the caller then binds the surface itself). */
+static u32 eng_crop_get(const eng_surface* s, u32 w, u32 h)
+{
+    eng_crop* c = NULL;
+    for (u32 i = 0; i < s_crop_n; i++)
+        if (s_crop[i].src == s->handle && s_crop[i].w == w && s_crop[i].h == h) { c = &s_crop[i]; break; }
+    if (!c) {
+        const u32 img = g.be->color_target_create(g.be->user, s->fmt, w, h, NULL, 0);
+        if (!img) return 0;
+        if (s_crop_n == ENG_CROP_MAX) {
+            u32 old = 0;
+            for (u32 i = 1; i < s_crop_n; i++) if (s_crop[i].last_use < s_crop[old].last_use) old = i;
+            g.be->color_target_release(g.be->user, s_crop[old].img);
+            s_crop[old] = s_crop[--s_crop_n];
+        }
+        c = &s_crop[s_crop_n++];
+        *c = (eng_crop){ s->handle, w, h, img, g.frames, s->xfer_gen - 1u, s->color_serial };
+        static u32 logs;
+        if (PS3_LOG_FIRST(logs, 16))
+            fprintf(stderr, "[rsx engine] texture %ux%u reads the corner of surface 0x%08X %ux%u: "
+                    "sampled from a copy\n", w, h, s->offset, s->w, s->h);
+    }
+    c->last_use = g.frames;
+    if (c->serial != s->color_serial || c->xfer_gen != s->xfer_gen) {
+        g.be->color_target_copy(g.be->user, s->handle, 0, 0, c->img, 0, 0, w, h);
+        c->serial = s->color_serial;
+        c->xfer_gen = s->xfer_gen;
+    }
+    return c->img;
+}
+
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot, u32 tex_used,
                               u32 textures[RSX_BE_MAX_TEXTURES],
@@ -3504,11 +3575,20 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             continue;
         }
         if (sampled >= 0) {
+            const eng_surface* ss = &g.surfaces[sampled];
+            u32 src = ss->handle;
+            /* Same rows (pitch) and no antialiasing: the texture's texels are
+             * the target's top-left t.width x t.height pixels. */
+            if (((t.width < ss->w && t.height <= ss->h) || (t.width <= ss->w && t.height < ss->h)) &&
+                ss->aa_grid == 0x101u && t.dimension != 3 && !t.cubemap &&
+                (!t.pitch || !ss->pitch || t.pitch == ss->pitch) && eng_crop_on()) {
+                const u32 crop = eng_crop_get(ss, t.width, t.height);
+                if (crop) src = crop;
+            }
             const u32 view = g.be->surface_view
-                ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
-                                     t.remap & 0xFFFFu, t.format)
+                ? g.be->surface_view(g.be->user, src, t.remap & 0xFFFFu, t.format)
                 : 0;
-            textures[u] = view ? view : g.surfaces[sampled].handle;
+            textures[u] = view ? view : src;
             continue;
         }
         if (base_fmt == RSX_TEX_FMT_DEPTH24_D8) {
@@ -4984,6 +5064,7 @@ void rsx_draw_engine_shutdown(void)
         if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
     }
+    eng_crop_drop(0);
     for (u32 i = 0; i < g.n_zdepths; i++) {
         if (g.zdepths[i].conv) g.be->texture_release(g.be->user, g.zdepths[i].conv);
         if (g.zdepths[i].dbz_copy) g.be->texture_release(g.be->user, g.zdepths[i].dbz_copy);
