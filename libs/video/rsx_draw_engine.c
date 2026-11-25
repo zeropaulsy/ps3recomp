@@ -1130,10 +1130,25 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
  * surface comes from that image. Guest memory gets the bytes only when the
  * engine or another transfer reads or overwrites them (xfer_sync). A PPU or
  * SPU touching them in between is not seen, so this is right only while
- * nothing else uses the bytes: opt-in. */
+ * nothing else uses the bytes: opt-in.
+ *
+ * Only a copy that repeats one of the previous frame (same destination and
+ * size) is held: the first copy to a destination goes to guest memory as
+ * usual, and at each present every held copy that was not made again during
+ * that frame is stored. An entry used to stay held until something read its
+ * range, however much later: LBP2 copies a 320x176 surface into its main heap
+ * once (~22 s, IO 0x00FF6D80), frees that memory, and loads the planet's mesh
+ * index buffers there (~57 s); the first index fetch then "stored" the old
+ * picture over the indices, and every mesh using them drew as long shards
+ * fanning out of vertex 0 (pod planet and the levels). */
 #define ENG_XS_MAX 8u
-typedef struct { u32 loc, off, pitch, w, h, img; } eng_xshadow;
+typedef struct { u32 loc, off, pitch, w, h, img, frame; } eng_xshadow;
 static eng_xshadow s_xs[ENG_XS_MAX];
+/* Destinations of the latest copies out, with the frame of each: only a copy
+ * that repeats one of the frame before is held on the GPU. */
+typedef struct { u32 loc, off, pitch, w, h, frame; } eng_xs_dest;
+static eng_xs_dest s_xs_recent[ENG_XS_MAX];
+static u32 s_xs_recent_next;
 static u32 s_xs_imgs[ENG_XS_MAX];    /* images kept for reuse, by size */
 static u32 s_xs_img_w[ENG_XS_MAX], s_xs_img_h[ENG_XS_MAX];
 static u32 s_xs_nimg;
@@ -1215,6 +1230,15 @@ void rsx_draw_engine_xfer_sync(u32 location, u32 offset, u32 pitch, u32 row_byte
         else i++;
 }
 
+/* At a present: a held copy that was not made again during this frame is
+ * not a per-frame round trip any more, so the guest gets its bytes now. */
+static void eng_xs_frame_end(void)
+{
+    for (u32 i = 0; i < s_xs_n; )
+        if (s_xs[i].frame != g.frames) eng_xs_store(i, "not copied again this frame");
+        else i++;
+}
+
 int rsx_draw_engine_xfer_out(u32 sloc, u32 soff, u32 spitch,
                              u32 dloc, u32 doff, u32 dpitch, u32 w, u32 h)
 {
@@ -1228,6 +1252,28 @@ int rsx_draw_engine_xfer_out(u32 sloc, u32 soff, u32 spitch,
     if (x + w > s->w || y + h > s->h) return 0;
     const u32 len = (h - 1u) * dpitch + w * 4u;
     if (eng_tiled(dloc, doff, len)) return 0;
+    {   /* a repeat of a copy made the frame before (or earlier this frame)? */
+        int repeat = 0;
+        eng_xs_dest* d = NULL;
+        for (u32 i = 0; i < ENG_XS_MAX; i++) {
+            eng_xs_dest* r = &s_xs_recent[i];
+            if (r->w == w && r->h == h && r->loc == dloc && r->off == doff && r->pitch == dpitch) {
+                d = r;
+                repeat = g.frames - r->frame <= 1u;
+                break;
+            }
+        }
+        if (!d) d = &s_xs_recent[s_xs_recent_next++ % ENG_XS_MAX];
+        *d = (eng_xs_dest){ dloc, doff, dpitch, w, h, g.frames };
+        if (!repeat) {
+            /* Not held, so the guest gets these bytes now: an older held copy
+             * they overlap must not land on top of them later. */
+            for (u32 i = 0; i < s_xs_n; )
+                if (eng_xs_overlaps(&s_xs[i], dloc, doff, dpitch, w * 4u, h)) eng_xs_store(i, "overlapped by a new copy");
+                else i++;
+            return 0;
+        }
+    }
     /* The same destination again takes over that entry; anything else it
      * overlaps keeps its bytes by storing them first. */
     u32 img = 0;
@@ -1254,7 +1300,7 @@ int rsx_draw_engine_xfer_out(u32 sloc, u32 soff, u32 spitch,
     }
     if (s_xs_n >= ENG_XS_MAX) return 0;
     g.be->color_target_copy(g.be->user, s->handle, x, y, img, 0, 0, w, h);
-    s_xs[s_xs_n++] = (eng_xshadow){ dloc, doff, dpitch, w, h, img };
+    s_xs[s_xs_n++] = (eng_xshadow){ dloc, doff, dpitch, w, h, img, g.frames };
     static int said;
     if (!said) { said = 1;
                  fprintf(stderr, "[rsx engine] RSX_ENGINE_XFER_SHADOW: first copy kept on the GPU "
@@ -3062,9 +3108,29 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         dc.n_verts = dc.n_immediate;
         return;
     }
-    for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
+    /* Several DRAW_ARRAYS / DRAW_INDEX_ARRAY ranges inside one BEGIN/END of a
+     * connected primitive (strip, fan, quad strip, polygon): a range that
+     * continues the previous one is the same primitive split into the
+     * method's 256-element chunks, but a range starting anywhere else is a
+     * primitive of its own. Joining it on would add connecting triangles
+     * between unrelated parts of the mesh -- long stretched shards across the
+     * screen (LBP2's planet and level geometry draws 100+ separate strips in
+     * one BEGIN/END). So each such range starts a new segment, exactly like a
+     * restart index. RPCS3 likewise draws non-contiguous ranges of these
+     * primitives as separate sub-draws. */
+    const u32 prim_now = g.rsx.current_primitive;
+    const int connected = prim_now == RSX_PRIMITIVE_TRIANGLE_STRIP ||
+                          prim_now == RSX_PRIMITIVE_TRIANGLE_FAN ||
+                          prim_now == RSX_PRIMITIVE_QUAD_STRIP ||
+                          prim_now == RSX_PRIMITIVE_POLYGON;
+    for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++) {
+        if (connected && b && dc.n_refs &&
+            dc.arr[b].first != dc.arr[b - 1].first + dc.arr[b - 1].count &&
+            !rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, dc.n_refs))
+            dc.fetch_ok = 0;
         for (u32 i = 0; i < dc.arr[b].count && dc.fetch_ok; i++)
             if (!dc_push_ref(dc.arr[b].first + i, 0)) dc.fetch_ok = 0;
+    }
 
     if (dc.n_idx && dc.fetch_ok) {
         const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
@@ -3079,6 +3145,12 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 
         for (u32 b = 0; b < dc.n_idx && dc.fetch_ok; b++) {
             const u32 first = dc.idx[b].first, count = dc.idx[b].count;
+            if (connected && b && dc.n_refs &&
+                first != dc.idx[b - 1].first + dc.idx[b - 1].count &&
+                !rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, dc.n_refs)) {
+                dc.fetch_ok = 0;
+                break;
+            }
             const u64 start = (u64)ia.offset + (u64)first * esz;
             const u64 bytes = (u64)count * esz;
             const u8* run = NULL;
@@ -4183,6 +4255,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
                 float v[4]; memcpy(v, g.rsx.constants[c], sizeof v);
                 fprintf(stderr, "[rsx constdump]  vc%-3u %g %g %g %g\n", c, v[0], v[1], v[2], v[3]);
             }
+            for (u32 c = 460; c < 468u; c++) {
+                float v[4]; memcpy(v, g.rsx.constants[c], sizeof v);
+                fprintf(stderr, "[rsx constdump]  vc%-3u %g %g %g %g\n", c, v[0], v[1], v[2], v[3]);
+            }
             for (u32 c = 0; c < g.fp_constants.count; c++) {
                 float v[4]; memcpy(v, g.fp_constants.values[c], sizeof v);
                 fprintf(stderr, "[rsx constdump]  fc%-3u %g %g %g %g\n", c, v[0], v[1], v[2], v[3]);
@@ -4205,6 +4281,168 @@ static void sink_end(void* user, const rsx_dispatch* r)
                     fprintf(stderr, " (%g %g %g %g)", f[0], f[1], f[2], f[3]);
                 }
                 fprintf(stderr, "\n");
+            }
+        }
+    }
+
+    /* RSX_ENGINE_GEODUMP=<dir>,<fp hex>[,<max draws>[,<start s>]]: write each draw of that
+     * fragment program as <dir>/geo_<n>.bin: u32 prim, n_verts, n_draw,
+     * indexed, n_src, n_cuts, stride, slot of attr0, then vc0..3 (16 floats),
+     * the attr0 values (float4 per vertex), the draw's indices (u32, if
+     * indexed), the source refs' vertex ids and the cuts. Replaying the draw
+     * on the CPU separates a wrong index/topology build from a GPU-side fault. */
+    {
+        static int gd_init; static char gd_dir[512]; static u64 gd_fp; static long gd_left, gd_n;
+        static double gd_t0, gd_from;
+        double gd_now = 0;
+        if (gd_init >= 0) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            gd_now = ts.tv_sec + ts.tv_nsec * 1e-9;
+            if (!gd_init) gd_t0 = gd_now;
+        }
+        if (!gd_init) {
+            gd_init = 1;
+            const char* e = getenv("RSX_ENGINE_GEODUMP");
+            const char* c1 = e ? strchr(e, ',') : NULL;
+            if (c1) {
+                snprintf(gd_dir, sizeof gd_dir, "%.*s", (int)(c1 - e), e);
+                char* d;
+                gd_fp = strtoull(c1 + 1, &d, 16);
+                gd_left = (*d == ',') ? strtol(d + 1, &d, 10) : 64;
+                gd_from = (*d == ',') ? strtod(d + 1, NULL) : 0.0;
+            } else gd_init = -1;
+        }
+        if (gd_fp && fp_hash == gd_fp && gd_left > 0 && dc.verts && gd_now - gd_t0 >= gd_from) {
+            gd_left--;
+            char path[600];
+            snprintf(path, sizeof path, "%s/geo_%04ld.bin", gd_dir, gd_n++);
+            FILE* f = fopen(path, "wb");
+            if (f) {
+                int k0 = -1;
+                for (u32 k = 0; k < dc.layout.count; k++)
+                    if (dc.layout.attrs[k] == 0) { k0 = (int)k; break; }
+                const u32 hdr[8] = { prim, dc.n_verts, n_draw, (u32)indexed,
+                                     dc.n_source_refs, dc.n_cuts, dc.layout.stride, (u32)k0 };
+                fwrite(hdr, 4, 8, f);
+                fwrite(g.rsx.constants, 16, 4, f);
+                for (u32 v = 0; v < dc.n_verts; v++) {
+                    float p[4] = { 0, 0, 0, 1 };
+                    if (k0 >= 0) memcpy(p, dc.verts + (size_t)v * dc.layout.stride + (u32)k0 * 16u, 16);
+                    fwrite(p, 4, 4, f);
+                }
+                if (indexed) fwrite(g.indices, 4, n_draw, f);
+                for (u32 i = 0; i < dc.n_source_refs; i++) {
+                    const u32 id = dc.refs_remapped
+                        ? dc.refs[dc.ref_remap.occurrence_to_unique[i]].vertex_id
+                        : dc.refs[i].vertex_id;
+                    fwrite(&id, 4, 1, f);
+                }
+                if (dc.n_cuts) fwrite(dc.cuts, 4, dc.n_cuts, f);
+                fclose(f);
+            }
+        }
+    }
+
+    /* RSX_ENGINE_VTXSTAT=<start s>[:<ms>]: for every draw in that time window
+     * (seconds since the engine's first draw; default 40 ms), one line with the draw's programs, vertex count and the
+     * position attribute's (attr 0) format, source and statistics: how many
+     * vertices are exactly 0,0,0, how many are NaN/Inf or huge, the xyz box.
+     * Finds the draw whose mesh collapses to a point (vertex data not yet
+     * written, or read from the wrong place). */
+    {
+        static int vs_init; static double vs_t0, vs_from, vs_until;
+        static struct { double t; u32 loc, off, bytes, hash, stage; } s_vs_sus[8];
+        double vs_now = 0;
+        if (vs_init >= 0) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            vs_now = ts.tv_sec + ts.tv_nsec * 1e-9;
+        }
+        if (!vs_init) {
+            vs_init = -1;
+            const char* e = getenv("RSX_ENGINE_VTXSTAT");
+            if (e && *e) {
+                char* d;
+                vs_init = 1; vs_t0 = vs_now;
+                vs_from = strtod(e, &d);
+                vs_until = vs_from + ((*d == ':') ? strtod(d + 1, NULL) : 40.0) / 1000.0;
+                fprintf(stderr, "[vtxstat] armed %.3f..%.3f s after the first draw (frame %u)\n", vs_from, vs_until, g.frames);
+            }
+        }
+        if (vs_init > 0) for (u32 k = 0; k < 8; k++) {
+            if (!s_vs_sus[k].t) continue;
+            const double due = s_vs_sus[k].stage == 0 ? 0.5 : 3.0;
+            if (vs_now - s_vs_sus[k].t < due) continue;
+            const u8* q = eng_guest_ptr(NULL, s_vs_sus[k].loc, s_vs_sus[k].off, s_vs_sus[k].bytes);
+            if (q) {
+                u32 h = 2166136261u, z = 0;
+                for (u32 i = 0; i < s_vs_sus[k].bytes; i++) { h = (h ^ q[i]) * 16777619u; z += q[i] == 0 || q[i] == 0xFF; }
+                fprintf(stderr, "[vtxstat] recheck 0x%08X +%.1f s: %s, 0/FF bytes %u of %u; first %02X%02X %02X%02X %02X%02X %02X%02X\n",
+                        s_vs_sus[k].off, due, h == s_vs_sus[k].hash ? "unchanged" : "CHANGED", z, s_vs_sus[k].bytes,
+                        q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+            }
+            if (++s_vs_sus[k].stage >= 2) s_vs_sus[k].t = 0;
+        }
+        if (vs_init > 0 && vs_now - vs_t0 >= vs_from && vs_now - vs_t0 < vs_until && dc.verts) {
+            int k0 = -1;
+            for (u32 k = 0; k < dc.layout.count; k++)
+                if (dc.layout.attrs[k] == 0) { k0 = (int)k; break; }
+            u32 zero = 0, bad = 0;
+            float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+            if (k0 >= 0)
+                for (u32 v = 0; v < dc.n_verts; v++) {
+                    float f[4];
+                    memcpy(f, dc.verts + (size_t)v * dc.layout.stride + (u32)k0 * 16u, sizeof f);
+                    if (f[0] == 0.0f && f[1] == 0.0f && f[2] == 0.0f) zero++;
+                    int b = 0;
+                    for (int c = 0; c < 3; c++) {
+                        if (!(f[c] == f[c]) || f[c] > 1e6f || f[c] < -1e6f) { b = 1; continue; }
+                        if (f[c] < mn[c]) mn[c] = f[c];
+                        if (f[c] > mx[c]) mx[c] = f[c];
+                    }
+                    bad += b;
+                }
+            const u32 fmt = rsx_dsp_reg(&g.rsx, 0x1740u);
+            const u32 off = rsx_dsp_reg(&g.rsx, 0x1680u);
+            const u32 ia_off = rsx_dsp_reg(&g.rsx, 0x181Cu);
+            const u32 ia_fmt = rsx_dsp_reg(&g.rsx, 0x1820u);
+            fprintf(stderr, "[vtxstat] f%u fp %016llx pipe %u prim %u verts %u src %u idx %u arr %u "
+                    "a0 fmt 0x%08X off 0x%08X ia 0x%08X/%X zero %u bad %u box %g..%g %g..%g %g..%g attrs 0x%04X cuts %u\n",
+                    g.frames, (unsigned long long)fp_hash, pipeline, prim, dc.n_verts,
+                    dc.n_source_refs, dc.n_idx, dc.n_arr, fmt, off, ia_off, ia_fmt, zero, bad,
+                    mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], rsx_dsp_reg(&g.rsx, 0x1FF0u), dc.n_cuts);
+            /* A draw whose indices name almost no distinct vertex: look at the
+             * index bytes now and again 30 ms later (written late = a race). */
+            if (dc.n_idx && dc.n_source_refs >= 64 && dc.n_verts * 8u < dc.n_source_refs) {
+                rsx_dsp_index_array ia;
+                rsx_dsp_get_index_array(&g.rsx, &ia);
+                const u32 esz = ia.is_u32 ? 4u : 2u;
+                const u32 cnt = dc.idx[0].count < 256u ? dc.idx[0].count : 256u;
+                const u32 loc = ia.location ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
+                const u8* p = eng_fetch_ptr(NULL, loc, ia.offset + dc.idx[0].first * esz, cnt * esz);
+                if (p) {
+                    u32 h0 = 2166136261u, h1 = 2166136261u, z0 = 0, z1 = 0;
+                    for (u32 i = 0; i < cnt * esz; i++) { h0 = (h0 ^ p[i]) * 16777619u; z0 += p[i] == 0 || p[i] == 0xFF; }
+                    struct timespec sl = { 0, 30 * 1000000 }; nanosleep(&sl, NULL);
+                    for (u32 i = 0; i < cnt * esz; i++) { h1 = (h1 ^ p[i]) * 16777619u; z1 += p[i] == 0 || p[i] == 0xFF; }
+                    fprintf(stderr, "[vtxstat]   suspect indices: %u bytes, 0/FF bytes %u -> %u after 30 ms, %s; first %02X%02X %02X%02X %02X%02X %02X%02X\n",
+                            cnt * esz, z0, z1, h0 == h1 ? "unchanged" : "CHANGED", p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+                    fprintf(stderr, "[vtxstat]   suspect at io 0x%08X loc %u first %u: host %p = guest 0x%08llX (resolve 0x%08X), detiled %d\n",
+                            ia.offset, loc, dc.idx[0].first, (const void*)p,
+                            (unsigned long long)(p - vm_base), cellGcmResolveLocated(loc == RSX_LOCATION_LOCAL, ia.offset + dc.idx[0].first * esz),
+                            eng_tiled(loc, ia.offset + dc.idx[0].first * esz, cnt * esz));
+                    for (u32 k = 0; k < 8; k++) if (!s_vs_sus[k].t) {
+                        s_vs_sus[k].t = vs_now; s_vs_sus[k].loc = loc; s_vs_sus[k].off = ia.offset + dc.idx[0].first * esz;
+                        s_vs_sus[k].bytes = cnt * esz; s_vs_sus[k].hash = h1; s_vs_sus[k].stage = 0; break; }
+                }
+            }
+            if (dc.n_idx > 1 || dc.n_arr > 1) {
+                const int ix = dc.n_idx > 1;
+                const u32 nb = ix ? dc.n_idx : dc.n_arr;
+                fprintf(stderr, "[vtxstat]   cuts %u batches", dc.n_cuts);
+                for (u32 b = 0; b < nb && b < 16; b++)
+                    fprintf(stderr, " %u+%u", ix ? dc.idx[b].first : dc.arr[b].first,
+                            ix ? dc.idx[b].count : dc.arr[b].count);
+                fprintf(stderr, "%s\n", nb > 16 ? " ..." : "");
             }
         }
     }
@@ -4642,6 +4880,7 @@ static void eng_present(u32 buffer_id)
     pd_present(target);
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
+    if (s_xs_n) eng_xs_frame_end();
     g.frames++;
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
