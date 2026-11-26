@@ -122,6 +122,7 @@ struct rsx_dispatch {
     u32 regs[RSX_DSP_NUM_REGS];       /* register file: regs[method >> 2]   */
     u32 vp[RSX_DSP_VP_WORDS];         /* transform (vertex) program words   */
     u32 constants[RSX_DSP_NUM_CONSTANTS][4]; /* vec4 f32 bit patterns       */
+    u32 constants_gen;                /* bumped when a constant word changes */
 
     rsx_dispatch_sink sink;
 

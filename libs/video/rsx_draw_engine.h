@@ -271,6 +271,10 @@ typedef struct rsx_draw_backend {
      * a new one and releasing the old (an allocation, a free and a wait for
      * the GPU each time). Zero keeps the create-and-swap. */
     int texture_upload_ordered;
+    /* Nonzero when constants passed to bind_vs_constants stay bound until
+     * the next call: the engine then calls it only when they changed (most
+     * draws reuse the previous draw's ~8 KB block). Zero: before every draw. */
+    int vs_constants_persist;
     /* Optional. A depth target's top-left w x h read as a texture of base
      * format `rsx_fmt` reads the bytes the zeta holds: a fresh texture (a
      * colour target for surface_view) whose texel is what depth_readback,

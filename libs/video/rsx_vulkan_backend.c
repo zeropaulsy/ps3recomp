@@ -124,6 +124,55 @@ VK_DEVICE_FNS(VK_DECLARE)
 VK_WSI_INSTANCE_FNS(VK_DECLARE)
 VK_WSI_DEVICE_FNS(VK_DECLARE)
 
+/* The engine's render pass stays open across batched draws into the same
+ * framebuffer (vk_eng_draw, VK_RP_MERGE): beginning and ending one per draw
+ * was ~1.2 us of driver time per draw, ~45 ms/s of the RSX thread in
+ * LittleBigPlanet 2. Every command that may not be recorded inside a render
+ * pass goes through the macros below, which first end an open one in the
+ * same command buffer, so no other recording site has to know about it. The
+ * bound pipeline and dynamic state are remembered only while it is open. */
+static struct {
+    int             open, st;
+    VkCommandBuffer cmd;
+    VkRenderPass    rp;
+    VkFramebuffer   fb;
+    VkPipeline      pipe;
+    VkViewport      vp;
+    VkRect2D        sc;
+    u32             sref;
+    float           db[2];
+    VkDescriptorSet set;
+    VkPipelineLayout playout;
+    VkBuffer        vbuf, ibuf;
+} s_erp;
+static void vk_rp_close_on(VkCommandBuffer cb)
+{
+    if (cb == s_erp.cmd && s_erp.open) {
+        pvkCmdEndRenderPass(s_erp.cmd);
+        s_erp.open = 0;
+        s_erp.st = 0;
+    }
+}
+#define VK_RP_CLOSING(fn, cb, ...) (vk_rp_close_on(cb), (fn)(cb, __VA_ARGS__))
+#define pvkCmdPipelineBarrier(cb, ...)        VK_RP_CLOSING(pvkCmdPipelineBarrier, cb, __VA_ARGS__)
+#define pvkCmdClearColorImage(cb, ...)        VK_RP_CLOSING(pvkCmdClearColorImage, cb, __VA_ARGS__)
+#define pvkCmdClearDepthStencilImage(cb, ...) VK_RP_CLOSING(pvkCmdClearDepthStencilImage, cb, __VA_ARGS__)
+#define pvkCmdCopyImageToBuffer(cb, ...)      VK_RP_CLOSING(pvkCmdCopyImageToBuffer, cb, __VA_ARGS__)
+#define pvkCmdCopyBufferToImage(cb, ...)      VK_RP_CLOSING(pvkCmdCopyBufferToImage, cb, __VA_ARGS__)
+#define pvkCmdCopyImage(cb, ...)              VK_RP_CLOSING(pvkCmdCopyImage, cb, __VA_ARGS__)
+#define pvkCmdBlitImage(cb, ...)              VK_RP_CLOSING(pvkCmdBlitImage, cb, __VA_ARGS__)
+#define pvkCmdBeginRenderPass(cb, ...)        VK_RP_CLOSING(pvkCmdBeginRenderPass, cb, __VA_ARGS__)
+#define pvkBeginCommandBuffer(cb, ...)        VK_RP_CLOSING(pvkBeginCommandBuffer, cb, __VA_ARGS__)
+#define pvkResetCommandBuffer(cb, ...)        VK_RP_CLOSING(pvkResetCommandBuffer, cb, __VA_ARGS__)
+#define pvkEndCommandBuffer(cb)               (vk_rp_close_on(cb), (pvkEndCommandBuffer)(cb))
+
+static int vk_rp_merge_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("VK_RP_MERGE"); on = !(e && *e == '0'); }
+    return on;
+}
+
 /* ---------------------------------------------------------------------------
  * Backend state
  * -------------------------------------------------------------------------*/
@@ -3705,6 +3754,7 @@ static struct {
     u32          scratch_w, scratch_h;
     u32          pipeline;
     u32          vs_bytes, ps_bytes;
+    int          vs_dirty, ps_dirty;   /* changed since copied to a batch's ring (s_ebc) */
     u8*          ucpu;                /* the constants, in the shared UBO's layout */
     u32          tex[RSX_BE_MAX_TEXTURES];
     rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES];
@@ -4195,8 +4245,9 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
     if (!s_g.on || !data || !vk_eng_ucpu()) { s_e2.vs_bytes = 0; return; }
     const u32 cap = (u32)s_g.ps_off;
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
-    memcpy(s_e2.ucpu, data, bytes);
+    memcpy(s_e2.ucpu, data, bytes);   /* the engine calls only on a change (vs_constants_persist) */
     s_e2.vs_bytes = bytes;
+    s_e2.vs_dirty = 1;
 }
 static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
 {
@@ -4204,8 +4255,11 @@ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
     if (!s_g.on || !data || !vk_eng_ucpu()) { s_e2.ps_bytes = 0; return; }
     const u32 cap = (u32)(s_g.ubo.size - s_g.ps_off);
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 4u)) { VK_LOG("engine: PS constants truncated\n"); s_e2.warned |= 4u; } }
+    /* Small and rebuilt by the engine every draw, but usually the same. */
+    if (bytes == s_e2.ps_bytes && !memcmp(s_e2.ucpu + s_g.ps_off, data, bytes)) return;
     memcpy(s_e2.ucpu + s_g.ps_off, data, bytes);
     s_e2.ps_bytes = bytes;
+    s_e2.ps_dirty = 1;
 }
 static void vk_eng_bind_textures(void* user, const u32* textures,
                                  const rsx_be_sampler_desc* samplers, u32 mask)
@@ -4533,6 +4587,21 @@ static struct {
     unsigned long long skipped, kept;
 } s_eb_hz;
 
+/* What the open slot's last batched draw used: its constant slices and its
+ * descriptor set with the views and samplers written into it. A draw whose
+ * constants have not changed since (s_e2.vs_dirty / ps_dirty) reads the same
+ * slices, and one that would write an identical set binds that one: in
+ * LittleBigPlanet 2 ~92% of draws keep the vertex constants (~8 KB) and ~70%
+ * the whole set. Emptied with the slot (vk_eb_slot_reset). */
+static struct {
+    int             valid, split;
+    VkDeviceSize    uvs, ups;
+    u32             vsb, psb;
+    VkDescriptorSet set;
+    VkImageView     views[RSX_MAX_TEXTURES];
+    VkSampler       samps[RSX_MAX_TEXTURES];
+} s_ebc;
+
 static int vk_eb_on(void)
 {
     if (s_eb.on >= 0) return s_eb.on;
@@ -4622,6 +4691,7 @@ static void vk_eb_release(void)
     vk_destroy_buffer(&s_eb.sb);
     if (s_eb.pool) pvkDestroyDescriptorPool(s_vk.device, s_eb.pool, NULL);
     memset(&s_eb, 0, sizeof s_eb);
+    memset(&s_ebc, 0, sizeof s_ebc);
     s_eb.on = -1;
 }
 
@@ -4664,6 +4734,7 @@ static void vk_eb_slot_reset(void)
 {
     s_eb_hz.after_draw = 0; s_eb_hz.ndirty = 0; s_eb_hz.overflow = 0;
     s_eb.vb_head = s_eb.ib_head = s_eb.ub_head = s_eb.sb_head = 0;
+    memset(&s_ebc, 0, sizeof s_ebc);
     if (s_eb.sets) { pvkResetDescriptorPool(s_vk.device, s_eb.pool, 0); s_eb.sets = 0; }
     if ((++s_eb.flushes & 0x3FFFu) == 0)
         VK_LOG("draw batching: %llu draws in %llu submissions (%llu without a wait, %llu of them "
@@ -4762,27 +4833,36 @@ static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P)
     return vk_eng_write_descriptors_to(P, set, s_g.ubo.buf, 0, s_g.ps_off);
 }
 
-static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescriptorSet set,
-                                                   VkBuffer ubo, VkDeviceSize vs_off, VkDeviceSize ps_off)
+/* The view and sampler each unit of the bound pipeline samples through
+ * (nothing bound: the dummy of the unit's kind). 0: no dummy cube. */
+static int vk_eng_resolve_units(const vk_eng_pipe* P, VkImageView* views, VkSampler* samps)
+{
+    const VkImageView dummy_cube = P->cube_mask ? vk_eng_dummy_cube_view() : VK_NULL_HANDLE;
+    if (P->cube_mask && !dummy_cube) return 0;
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
+        const int cube = (P->cube_mask >> u) & 1u;
+        VkImageView v = ((s_e2.tex_mask >> u) & 1u) ? vk_eng_sample_view(s_e2.tex[u], cube)
+                                                     : VK_NULL_HANDLE;
+        samps[u] = v ? vk_eng_sampler(&s_e2.samp[u]) : s_vk.sampler;
+        views[u] = v ? v : (cube ? dummy_cube : s_vk.dummy.view);
+    }
+    return 1;
+}
+
+static VkDescriptorSet vk_eng_write_set(const vk_eng_pipe* P, VkDescriptorSet set, VkBuffer ubo,
+                                        VkDeviceSize vs_off, VkDeviceSize ps_off,
+                                        const VkImageView* views, const VkSampler* samps)
 {
     const int split = P->cube_mask != 0;
     if (!set) return VK_NULL_HANDLE;
-    const VkImageView dummy_cube = split ? vk_eng_dummy_cube_view() : VK_NULL_HANDLE;
-    if (split && !dummy_cube) return VK_NULL_HANDLE;
     VkDescriptorBufferInfo bi[2] = {
         { ubo, vs_off, s_e2.vs_bytes ? s_e2.vs_bytes : 16u },
         { ubo, ps_off, s_e2.ps_bytes ? s_e2.ps_bytes : 16u },
     };
     VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], si[RSX_MAX_TEXTURES];
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
-        const int cube = (P->cube_mask >> u) & 1u;
-        VkImageView v = ((s_e2.tex_mask >> u) & 1u) ? vk_eng_sample_view(s_e2.tex[u], cube)
-                                                     : VK_NULL_HANDLE;
-        VkSampler smp = v ? vk_eng_sampler(&s_e2.samp[u]) : s_vk.sampler;
-        ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE,
-                                         v ? v : (cube ? dummy_cube : s_vk.dummy.view),
-                                         VK_IMAGE_LAYOUT_GENERAL };
-        si[u] = (VkDescriptorImageInfo){ smp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
+        ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, views[u], VK_IMAGE_LAYOUT_GENERAL };
+        si[u] = (VkDescriptorImageInfo){ samps[u], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
     }
     VkWriteDescriptorSet w[3 + RSX_MAX_TEXTURES];
     u32 n = 0;
@@ -4807,6 +4887,15 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
     }
     pvkUpdateDescriptorSets(s_vk.device, n, w, 0, NULL);
     return set;
+}
+
+static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescriptorSet set,
+                                                   VkBuffer ubo, VkDeviceSize vs_off, VkDeviceSize ps_off)
+{
+    VkImageView views[RSX_MAX_TEXTURES];
+    VkSampler samps[RSX_MAX_TEXTURES];
+    if (!set || !vk_eng_resolve_units(P, views, samps)) return VK_NULL_HANDLE;
+    return vk_eng_write_set(P, set, ubo, vs_off, ps_off, views, samps);
 }
 
 /* VK_DRAW_BARRIER_TRACK (default on; =0 for the old behaviour): a batched
@@ -4906,25 +4995,52 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
          * batch (which empties them all) and the draw takes its slices again. */
         for (int tries = 0; tries < 2; tries++) {
             VkDeviceSize vh = s_eb.vb_head, ih = s_eb.ib_head, uh = s_eb.ub_head;
-            voff = vk_eb_take(&vh, VK_EB_VB_BYTES, vbytes, 16u);
+            /* At a multiple of the stride: the draw starts there through
+             * vertexOffset / firstVertex, so the ring stays bound. */
+            voff = vk_eb_take(&vh, VK_EB_VB_BYTES, vbytes, stride);
             ioff = ibytes ? vk_eb_take(&ih, VK_EB_IB_BYTES, ibytes, 16u) : 0;
-            const VkDeviceSize uvs = vk_eb_take(&uh, VK_EB_UB_BYTES, vsb, s_eb.ub_align);
-            const VkDeviceSize ups = uvs == (VkDeviceSize)-1 ? uvs : vk_eb_take(&uh, VK_EB_UB_BYTES, psb, s_eb.ub_align);
-            if (voff != (VkDeviceSize)-1 && ioff != (VkDeviceSize)-1 && ups != (VkDeviceSize)-1 &&
-                s_eb.sets < VK_EB_MAX_SETS) {
-                VkDescriptorSetLayout lay = P->cube_mask ? s_e2.split_layout : s_g.set_layout;
-                VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                                                    .descriptorPool = s_eb.pool, .descriptorSetCount = 1,
-                                                    .pSetLayouts = &lay };
-                if (pvkAllocateDescriptorSets(s_vk.device, &dai, &set) == VK_SUCCESS) {
-                    s_eb.sets++;
+            /* Constants unchanged since this batch's last draw: its slices (s_ebc). */
+            const int vs_reuse = s_ebc.valid && !s_e2.vs_dirty && s_ebc.vsb == vsb;
+            const int ps_reuse = s_ebc.valid && !s_e2.ps_dirty && s_ebc.psb == psb;
+            const VkDeviceSize uvs = vs_reuse ? s_ebc.uvs : vk_eb_take(&uh, VK_EB_UB_BYTES, vsb, s_eb.ub_align);
+            const VkDeviceSize ups = uvs == (VkDeviceSize)-1 ? uvs
+                                   : ps_reuse ? s_ebc.ups : vk_eb_take(&uh, VK_EB_UB_BYTES, psb, s_eb.ub_align);
+            if (voff != (VkDeviceSize)-1 && ioff != (VkDeviceSize)-1 && ups != (VkDeviceSize)-1) {
+                VkImageView views[RSX_MAX_TEXTURES];
+                VkSampler samps[RSX_MAX_TEXTURES];
+                if (!vk_eng_resolve_units(P, views, samps)) return;
+                const int split = P->cube_mask != 0;
+                if (vs_reuse && ps_reuse && s_ebc.set && s_ebc.split == split &&
+                    !memcmp(views, s_ebc.views, sizeof views) && !memcmp(samps, s_ebc.samps, sizeof samps)) {
+                    set = s_ebc.set;                      /* the same set again */
+                } else if (s_eb.sets < VK_EB_MAX_SETS) {
+                    VkDescriptorSetLayout lay = split ? s_e2.split_layout : s_g.set_layout;
+                    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                        .descriptorPool = s_eb.pool, .descriptorSetCount = 1,
+                                                        .pSetLayouts = &lay };
+                    if (pvkAllocateDescriptorSets(s_vk.device, &dai, &set) == VK_SUCCESS) {
+                        s_eb.sets++;
+                        vk_eng_write_set(P, set, s_eb.ub.buf, uvs, ups, views, samps);
+                        s_ebc.set = set; s_ebc.split = split;
+                        memcpy(s_ebc.views, views, sizeof views);
+                        memcpy(s_ebc.samps, samps, sizeof samps);
+                    } else {
+                        set = VK_NULL_HANDLE;
+                    }
+                }
+                if (set) {
                     s_eb.vb_head = vh; s_eb.ib_head = ih; s_eb.ub_head = uh;
-                    memcpy((u8*)s_eb.ub.ptr + uvs, vk_eng_ucpu(), vsb);
-                    memcpy((u8*)s_eb.ub.ptr + ups, vk_eng_ucpu() + s_g.ps_off, psb);
-                    if (!vk_eng_write_descriptors_to(P, set, s_eb.ub.buf, uvs, ups)) return;
+                    if (!vs_reuse) {
+                        memcpy((u8*)s_eb.ub.ptr + uvs, vk_eng_ucpu(), vsb);
+                        s_ebc.uvs = uvs; s_ebc.vsb = vsb; s_e2.vs_dirty = 0;
+                    }
+                    if (!ps_reuse) {
+                        memcpy((u8*)s_eb.ub.ptr + ups, vk_eng_ucpu() + s_g.ps_off, psb);
+                        s_ebc.ups = ups; s_ebc.psb = psb; s_e2.ps_dirty = 0;
+                    }
+                    s_ebc.valid = 1;
                     break;
                 }
-                set = VK_NULL_HANDLE;
             }
             if (tries || !s_eb_pending) { batched = 0; break; }
             vk_eng_flush_async();
@@ -4967,11 +5083,18 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         vk_eb_dirty_add(zo && dview == zo->im.view ? zo->im.img : VK_NULL_HANDLE);
         if (full_barrier) s_eb_hz.kept++; else s_eb_hz.skipped++;
     }
-    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-                                  .renderPass = rp, .framebuffer = fb,
-                                  .renderArea = { { 0, 0 }, { w, h } } };
-    pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-    pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    /* Batched: continue the open pass when it is this draw's (a barrier
+     * above has ended it; see s_erp). Otherwise begin one. */
+    const int keep = batched && vk_rp_merge_on();
+    if (!(keep && s_erp.open && s_erp.cmd == s_vk.cmd && s_erp.rp == rp && s_erp.fb == fb)) {
+        VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                      .renderPass = rp, .framebuffer = fb,
+                                      .renderArea = { { 0, 0 }, { w, h } } };
+        pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        if (keep) { s_erp.open = 1; s_erp.st = 0; s_erp.cmd = s_vk.cmd; s_erp.rp = rp; s_erp.fb = fb; }
+    }
+    const int st = keep && s_erp.st;          /* the remembered state is valid */
+    if (!st || s_erp.pipe != pipe) pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
     if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
         vp.x = s_e2.vp[0]; vp.y = s_e2.vp[1]; vp.width = s_e2.vp[2]; vp.height = s_e2.vp[3];
@@ -4985,22 +5108,31 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         sc.offset.x = (int32_t)x0; sc.offset.y = (int32_t)y0;
         sc.extent.width = x1 > x0 ? x1 - x0 : 0; sc.extent.height = y1 > y0 ? y1 - y0 : 0;
     }
-    pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
-    pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
-    pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
-    if (s_vk.depth_bounds_ok)
+    if (!st || memcmp(&s_erp.vp, &vp, sizeof vp)) pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
+    if (!st || memcmp(&s_erp.sc, &sc, sizeof sc)) pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
+    if (!st || s_erp.sref != (s_e2.stencil_ref & 0xFFu))
+        pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
+    if (s_vk.depth_bounds_ok && (!st || memcmp(s_erp.db, s_e2.depth_bounds, sizeof s_erp.db)))
         pvkCmdSetDepthBounds(s_vk.cmd, s_e2.depth_bounds[0], s_e2.depth_bounds[1]);
-    pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                             P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout,
-                             0, 1, &set, 0, NULL);
-    pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vbuf, &voff);
-    if (ibytes) {
-        pvkCmdBindIndexBuffer(s_vk.cmd, ibuf, ioff, VK_INDEX_TYPE_UINT32);
-        pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
-    } else {
-        pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
+    if (keep) {
+        s_erp.pipe = pipe; s_erp.vp = vp; s_erp.sc = sc; s_erp.sref = s_e2.stencil_ref & 0xFFu;
+        memcpy(s_erp.db, s_e2.depth_bounds, sizeof s_erp.db);
+        s_erp.st = 1;
     }
-    pvkCmdEndRenderPass(s_vk.cmd);
+    const VkPipelineLayout playout = P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout;
+    if (!st || s_erp.set != set || s_erp.playout != playout)
+        pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, playout, 0, 1, &set, 0, NULL);
+    if (keep) { s_erp.set = set; s_erp.playout = playout; }
+    const VkDeviceSize zero = 0;
+    if (!st || s_erp.vbuf != vbuf) pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vbuf, &zero);
+    if (ibytes && (!st || s_erp.ibuf != ibuf)) pvkCmdBindIndexBuffer(s_vk.cmd, ibuf, 0, VK_INDEX_TYPE_UINT32);
+    if (keep) { s_erp.vbuf = vbuf; if (ibytes) s_erp.ibuf = ibuf; }
+    if (ibytes) {
+        pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, (u32)(ioff / 4u), (int32_t)(voff / stride), 0);
+    } else {
+        pvkCmdDraw(s_vk.cmd, vertex_count, 1, (u32)(voff / stride), 0);
+    }
+    if (!keep) pvkCmdEndRenderPass(s_vk.cmd);
     if (!batched) { vk_submit_and_wait(); return; }
     s_eb.draws++;
     s_eb_hz.after_draw = ++s_eb_pending;
@@ -5048,6 +5180,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     /* Every draw and every upload submits and waits, so an upload runs after
      * each earlier draw that sampled the old bytes has completed. */
     .texture_upload_ordered = 1,
+    .vs_constants_persist   = 1,
 };
 
 static rsx_backend s_vulkan_backend = {

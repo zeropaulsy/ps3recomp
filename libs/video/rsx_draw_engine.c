@@ -213,6 +213,9 @@ static struct {
     u8* tex_staging;
     u32 tex_staging_cap;
     u8* vp_cb;
+    u32 vp_cb_gen;          /* g.rsx.constants_gen vp_cb was built from */
+    int vp_cb_valid;        /* vp_cb holds that build */
+    int vp_cb_unbound;      /* vp_cb changed since the backend last had it */
     u8* fp_cb;
     u32 fp_cb_cap;
     u32* indices;
@@ -4363,8 +4366,15 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
     }
-    memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
-    memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+    /* Rebuilt only when a constant or the viewport transform changed. */
+    if (!g.vp_cb_valid || g.vp_cb_gen != g.rsx.constants_gen ||
+        memcmp(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf)) {
+        memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
+        memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+        g.vp_cb_gen = g.rsx.constants_gen;
+        g.vp_cb_valid = 1;
+        g.vp_cb_unbound = 1;
+    }
 
     /* The buffered fragment constants, then fp_alpha: the layout
      * rsx_fp_decompile_buffered_ex compiled the shader against. */
@@ -4797,7 +4807,10 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
     for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
     g.be->bind_pipeline(g.be->user, pipeline);
-    g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+    if (!g.be->vs_constants_persist || g.vp_cb_unbound) {
+        g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+        g.vp_cb_unbound = 0;
+    }
     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
@@ -5100,6 +5113,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
       s_depth_via_guest = e && *e && strcmp(e, "0") != 0; }
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
     if (!g.vp_cb) return -1;
+    g.vp_cb_valid = 0;
     if (g.be->init && g.be->init(g.be->user, g.width, g.height) != 0) {
         free(g.vp_cb); g.vp_cb = NULL;
         return -1;
