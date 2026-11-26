@@ -3111,6 +3111,46 @@ static int dc_reserve_indices(u32 count)
  * than fetching a phantom vertex wherever the restart sentinel appears, then
  * collapse repeated references and fetch each unique vertex once.
  * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
+/* RSX_ENGINE_FETCHSTAT=1: where the RSX thread's draw time goes (vertex
+ * gathering, remap, decode, backend upload), printed every 10 s. */
+static struct {
+    int on; u64 last, cpu_last;
+    u64 rawb, tslots[8], tsz[8][5], stable, unstable, t1, end, refs, remap, prep, decode, draw, draws, verts, srcrefs, bytes, ibytes;
+} s_fst = { .on = -1 };
+static inline u64 fst_ns(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+static int fst_on(void)
+{
+    if (s_fst.on < 0) { const char* e = getenv("RSX_ENGINE_FETCHSTAT"); s_fst.on = e && *e && *e != '0'; }
+    return s_fst.on;
+}
+static void fst_report(u64 now)
+{
+    struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    const u64 cpu = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+    if (!s_fst.last) { s_fst.last = now; s_fst.cpu_last = cpu; return; }
+    if (now - s_fst.last < 10000000000ull) return;
+    /* Per second of wall time: ms values are ms of RSX-thread time per s. */
+    const double f = (double)(now - s_fst.last) / 1e9, ms = 1e6 * f;
+    fprintf(stderr, "[fetchstat] per s: rsx cpu %.1f ms | sink_end %.1f: refs %.1f remap %.1f "
+            "prep %.1f decode %.1f be_draw %.1f | %.0f draws %.0f src refs %.0f verts %.0f KB vtx %.0f KB idx\n",
+            (cpu - s_fst.cpu_last) / ms, s_fst.end / ms,
+            s_fst.refs / ms, s_fst.remap / ms, s_fst.prep / ms, s_fst.decode / ms, s_fst.draw / ms,
+            s_fst.draws / f, s_fst.srcrefs / f, s_fst.verts / f, s_fst.bytes / f / 1024.0, s_fst.ibytes / f / 1024.0);
+    fprintf(stderr, "[fetchstat] per s: raw %.0f KB, stable %.0f unstable %.0f attr-verts; by type (verts, sizes 1-4):",
+            s_fst.rawb / f / 1024.0, s_fst.stable / f, s_fst.unstable / f);
+    for (int t = 0; t < 8; t++) if (s_fst.tslots[t])
+        fprintf(stderr, " t%d %.0f [%.0f %.0f %.0f %.0f]", t, s_fst.tslots[t] / f,
+                s_fst.tsz[t][1] / f, s_fst.tsz[t][2] / f, s_fst.tsz[t][3] / f, s_fst.tsz[t][4] / f);
+    fprintf(stderr, "\n");
+    const int on = s_fst.on;
+    memset(&s_fst, 0, sizeof s_fst);
+    s_fst.on = on; s_fst.last = now; s_fst.cpu_last = cpu;
+}
+
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
     if (dc.n_immediate) {
@@ -3198,6 +3238,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         }
     }
     if (!dc.fetch_ok) return;
+    const u64 fst_t1 = s_fst.on > 0 ? fst_ns() : 0;
 
     dc.n_source_refs = dc.n_refs;
     /* Only a topology this engine rebuilds through an index buffer may share
@@ -3211,6 +3252,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         }
     }
 
+    const u64 fst_t2 = s_fst.on > 0 ? fst_ns() : 0;
     dc.layout = *layout;
     rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_fetch_ptr, NULL);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
@@ -3219,12 +3261,27 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         dc.fetch_ok = 0;
         return;
     }
+    const u64 fst_t3 = s_fst.on > 0 ? fst_ns() : 0;
     if (!rsx_vertex_fetch_many(&dc.fetch_plan, dc.refs, dc.n_refs,
                                layout->stride ? dc.verts : NULL)) {
         dc.fetch_ok = 0;
         return;
     }
     dc.n_verts = dc.n_refs;
+    if (s_fst.on > 0) {
+        const u64 t4 = fst_ns();
+        s_fst.remap += fst_t2 - fst_t1; s_fst.prep += fst_t3 - fst_t2; s_fst.decode += t4 - fst_t3;
+        s_fst.srcrefs += dc.n_source_refs; s_fst.verts += dc.n_refs;
+        s_fst.bytes += (u64)dc.n_refs * layout->stride;
+        s_fst.t1 = fst_t1;   /* the caller adds t1 - its start to refs */
+        for (u32 sl = 0; sl < layout->count; sl++) {
+            const rsx_vertex_fetch_attr* fa = &dc.fetch_plan.attr[layout->attrs[sl]];
+            const u32 ty = fa->desc.type & 7u, sz = fa->desc.size < 5 ? fa->desc.size : 0;
+            s_fst.tslots[ty] += dc.n_refs; s_fst.tsz[ty][sz] += dc.n_refs;
+            s_fst.rawb += (u64)dc.n_refs * fa->elem_size;
+            if (fa->stable_base) s_fst.stable += dc.n_refs; else s_fst.unstable += dc.n_refs;
+        }
+    }
 }
 
 /* ---- sink ---------------------------------------------------------------- */
@@ -4169,7 +4226,18 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
                 what, rc[0], rc[1], rc[2], rc[3], w, h);
 }
 
+static void sink_end_body(void* user, const rsx_dispatch* r);
 static void sink_end(void* user, const rsx_dispatch* r)
+{
+    if (!fst_on()) { sink_end_body(user, r); return; }
+    const u64 t0 = fst_ns();
+    sink_end_body(user, r);
+    const u64 t1 = fst_ns();
+    s_fst.end += t1 - t0;
+    fst_report(t1);
+}
+
+static void sink_end_body(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
@@ -4199,7 +4267,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
-    dc_fetch(&layout, rebuild);
+    { const u64 fst_s = s_fst.on > 0 ? fst_ns() : 0;
+      dc_fetch(&layout, rebuild);
+      if (s_fst.t1) { s_fst.refs += s_fst.t1 - fst_s; s_fst.t1 = 0; } }
     if (!dc.n_verts || !dc.fetch_ok) return;
 
     int indexed = 0;
@@ -4773,8 +4843,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
     }
 
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
+    const u64 fst_d = s_fst.on > 0 ? fst_ns() : 0;
     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    if (s_fst.on > 0) { s_fst.draw += fst_ns() - fst_d; s_fst.draws++; s_fst.ibytes += indexed ? (u64)n_draw * 4u : 0; }
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */

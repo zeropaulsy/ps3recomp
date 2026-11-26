@@ -327,10 +327,90 @@ int rsx_vertex_fetch_one(
     return 1;
 }
 
+#if defined(__SSSE3__)
+#include <tmmintrin.h>
+/* Four-lane decoders for the stable-range loop. Each gives exactly the floats
+ * the scalar decoders above give (same IEEE operations, lane by lane): the
+ * integer types convert exactly and divide with divps instead of divss, and
+ * the half conversion is the same bit construction (zero/denormal -> signed
+ * zero, exponent 31 -> inf/NaN with the mantissa kept). Lanes past the
+ * attribute's size read as 0 and the w lane as 1, as the scalar loop presets. */
+static inline __m128i rsx_v_load(const u8* src, u32 bytes)
+{
+    /* Direct loads of exactly `bytes` (never past the element: it may end
+     * the mapping). A copy through a stack temporary would stall on store
+     * forwarding for every vertex. */
+    u32 a, b;
+    switch (bytes) {
+    case 16: return _mm_loadu_si128((const __m128i*)src);
+    case 12: memcpy(&a, src + 8, 4);
+             return _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i*)src), _mm_cvtsi32_si128((int)a));
+    case 8:  return _mm_loadl_epi64((const __m128i*)src);
+    case 6:  memcpy(&a, src, 4); b = (u32)src[4] | ((u32)src[5] << 8);
+             return _mm_unpacklo_epi32(_mm_cvtsi32_si128((int)a), _mm_cvtsi32_si128((int)b));
+    case 4:  memcpy(&a, src, 4); return _mm_cvtsi32_si128((int)a);
+    case 2:  return _mm_cvtsi32_si128((int)((u32)src[0] | ((u32)src[1] << 8)));
+    default: break;
+    }
+    u8 t[16] = { 0 };
+    memcpy(t, src, bytes);
+    return _mm_loadu_si128((const __m128i*)t);
+}
+static inline __m128 rsx_v_w1(__m128 v, u32 n)
+{
+    /* Lane 3 is +0.0 when n < 4: OR in the bits of 1.0f. */
+    return n < 4 ? _mm_or_ps(v, _mm_castsi128_ps(_mm_set_epi32(0x3F800000, 0, 0, 0))) : v;
+}
+static inline __m128 rsx_v_f32(const u8* src, u32 n)
+{
+    const __m128i sw = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    return rsx_v_w1(_mm_castsi128_ps(_mm_shuffle_epi8(rsx_v_load(src, n * 4u), sw)), n);
+}
+/* Big-endian 16-bit lanes to 32-bit lanes: zero-extended, or shifted to the
+ * top for a sign-extending shift. */
+static inline __m128i rsx_v_u16(const u8* src, u32 n)
+{
+    const __m128i sw = _mm_setr_epi8(1, 0, -1, -1, 3, 2, -1, -1, 5, 4, -1, -1, 7, 6, -1, -1);
+    return _mm_shuffle_epi8(rsx_v_load(src, n * 2u), sw);
+}
+static inline __m128i rsx_v_s16(const u8* src, u32 n)
+{
+    const __m128i sw = _mm_setr_epi8(-1, -1, 1, 0, -1, -1, 3, 2, -1, -1, 5, 4, -1, -1, 7, 6);
+    return _mm_srai_epi32(_mm_shuffle_epi8(rsx_v_load(src, n * 2u), sw), 16);
+}
+static inline __m128 rsx_v_f16(const u8* src, u32 n)
+{
+    const __m128i h = rsx_v_u16(src, n);
+    const __m128i e = _mm_and_si128(h, _mm_set1_epi32(0x7C00));
+    const __m128i zero = _mm_cmpeq_epi32(e, _mm_setzero_si128());
+    const __m128i inf = _mm_cmpeq_epi32(e, _mm_set1_epi32(0x7C00));
+    /* ((exp + 112) << 23) | (man << 13) == ((h & 0x7FFF) << 13) + (112 << 23);
+     * exponent 31 wants 0x7F800000 | (man << 13): add 224 << 23 instead. */
+    const __m128i add = _mm_add_epi32(_mm_set1_epi32(0x38000000),
+                                      _mm_and_si128(inf, _mm_set1_epi32(0x38000000)));
+    __m128i r = _mm_add_epi32(_mm_slli_epi32(_mm_and_si128(h, _mm_set1_epi32(0x7FFF)), 13), add);
+    r = _mm_andnot_si128(zero, r);
+    r = _mm_or_si128(r, _mm_slli_epi32(_mm_and_si128(h, _mm_set1_epi32(0x8000)), 16));
+    return rsx_v_w1(_mm_castsi128_ps(r), n);
+}
+static inline __m128 rsx_v_cmp32(const u8* src)
+{
+    const u32 word = ((u32)src[0] << 24) | ((u32)src[1] << 16) |
+                     ((u32)src[2] << 8) | (u32)src[3];
+    const s32 x = (s32)(word << 21) >> 21;
+    const s32 y = (s32)(word << 10) >> 21;
+    const s32 z = (s32)word >> 22;
+    return _mm_div_ps(_mm_cvtepi32_ps(_mm_setr_epi32(x, y, z, 1)),
+                      _mm_setr_ps(1023.0f, 1023.0f, 511.0f, 1.0f));
+}
+#define RSX_FETCH_SIMD 1
+#endif
+
 /* The stable-range loop for one attribute and one vertex type: `decode`
- * reads `src` into `v` (pre-set to 0,0,0,1) for components c < n. Elements
- * outside the stable range take the one-vertex path. */
-#define RSX_FETCH_LOOP(decode)                                                  \
+ * reads `src` into `v` (pre-set to 0,0,0,1) for components c < N. Elements
+ * outside the stable range take the one-vertex path. N is a constant at each
+ * use (RSX_FETCH_SIZES), so the component loop unrolls. */
+#define RSX_FETCH_LOOP(N, decode)                                               \
     for (u32 i = 0; i < count; i++) {                                           \
         float* v = (float*)(out + (size_t)i * stride + slot * 16u);             \
         const u32 element = plain                                               \
@@ -342,9 +422,43 @@ int rsx_vertex_fetch_one(
             continue;                                                           \
         }                                                                       \
         const u8* src = base + (u64)(element - first) * fstride;                \
-        v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;                                 \
-        for (u32 c = 0; c < n; c++) { decode; }                                 \
+        float w[4] = { 0.0f, 0.0f, 0.0f, 1.0f };                                \
+        for (u32 c = 0; c < (N); c++) { decode; } \
+        memcpy(v, w, 16);                                                       \
     }
+/* One RSX_FETCH_LOOP per component count. */
+#define RSX_FETCH_SIZES(decode)                                                 \
+    switch (n) {                                                                \
+    case 1: RSX_FETCH_LOOP(1, decode) break;                                    \
+    case 2: RSX_FETCH_LOOP(2, decode) break;                                    \
+    case 3: RSX_FETCH_LOOP(3, decode) break;                                    \
+    default: RSX_FETCH_LOOP(4, decode) break;                                   \
+    }
+
+#ifdef RSX_FETCH_SIMD
+/* RSX_FETCH_LOOP with a four-lane decoder: `expr` gives the vertex's __m128. */
+#define RSX_FETCH_LOOP_V(expr)                                                  \
+    for (u32 i = 0; i < count; i++) {                                           \
+        float* v = (float*)(out + (size_t)i * stride + slot * 16u);             \
+        const u32 element = plain                                               \
+            ? ((refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu)          \
+            : rsx_vertex_element_index(refs[i].vertex_id, refs[i].base_index,   \
+                                       fetch->desc.frequency, modulo);          \
+        if (element - first > span) {                                          \
+            if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v)) return 0;      \
+            continue;                                                           \
+        }                                                                       \
+        const u8* src = base + (u64)(element - first) * fstride;                \
+        _mm_storeu_ps(v, (expr));                                               \
+    }
+#define RSX_FETCH_SIZES_V(fn)                                                   \
+    switch (n) {                                                                \
+    case 1: RSX_FETCH_LOOP_V(fn(src, 1)) break;                                 \
+    case 2: RSX_FETCH_LOOP_V(fn(src, 2)) break;                                 \
+    case 3: RSX_FETCH_LOOP_V(fn(src, 3)) break;                                 \
+    default: RSX_FETCH_LOOP_V(fn(src, 4)) break;                                \
+    }
+#endif
 
 int rsx_vertex_fetch_many(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
@@ -358,8 +472,14 @@ int rsx_vertex_fetch_many(
         const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
         const u8* base = fetch->stable_base;
         const u32 type = fetch->desc.type;
-        if (!type || !fetch->desc.size || !base ||
-            type < RSX_VTX_TYPE_SNORM16 || type > RSX_VTX_TYPE_UINT8) {
+        /* A disabled array: every vertex reads the attribute's default, as
+         * rsx_vertex_fetch_attr_value would one vertex at a time. */
+        if (!type || !fetch->desc.size) {
+            for (u32 i = 0; i < count; i++)
+                memcpy(out + (size_t)i * stride + slot * 16u, fetch->default_value, 16u);
+            continue;
+        }
+        if (!base || type < RSX_VTX_TYPE_SNORM16 || type > RSX_VTX_TYPE_UINT8) {
             for (u32 i = 0; i < count; i++)
                 if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i],
                         (float*)(out + (size_t)i * stride + slot * 16u)))
@@ -374,34 +494,74 @@ int rsx_vertex_fetch_many(
         const u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
         switch (type) {
         case RSX_VTX_TYPE_FLOAT:
-            RSX_FETCH_LOOP(v[c] = rsx_compact_be_f32(src + c * 4))
+#ifdef RSX_FETCH_SIMD
+            RSX_FETCH_SIZES_V(rsx_v_f32)
+#else
+            RSX_FETCH_SIZES(w[c] = rsx_compact_be_f32(src + c * 4))
+#endif
             break;
         case RSX_VTX_TYPE_HALF:
-            RSX_FETCH_LOOP(v[c] = rsx_compact_be_f16(src + c * 2))
+#ifdef RSX_FETCH_SIMD
+            RSX_FETCH_SIZES_V(rsx_v_f16)
+#else
+            RSX_FETCH_SIZES(w[c] = rsx_compact_be_f16(src + c * 2))
+#endif
             break;
         case RSX_VTX_TYPE_UNORM8:
-            RSX_FETCH_LOOP(v[c] = src[c] / 255.0f)
+            RSX_FETCH_SIZES(w[c] = src[c] / 255.0f)
             break;
         case RSX_VTX_TYPE_UINT8:
-            RSX_FETCH_LOOP(v[c] = (float)src[c])
+            RSX_FETCH_SIZES(w[c] = (float)src[c])
             break;
         case RSX_VTX_TYPE_SNORM16:
-            RSX_FETCH_LOOP(v[c] = (s16)((src[c * 2] << 8) | src[c * 2 + 1]) / 32767.0f)
+#ifdef RSX_FETCH_SIMD
+#define RSX_V_SN16(p, k) rsx_v_w1(_mm_div_ps(_mm_cvtepi32_ps(rsx_v_s16(p, k)), _mm_set1_ps(32767.0f)), k)
+            RSX_FETCH_SIZES_V(RSX_V_SN16)
+#undef RSX_V_SN16
+#else
+            RSX_FETCH_SIZES(w[c] = (s16)((src[c * 2] << 8) | src[c * 2 + 1]) / 32767.0f)
+#endif
             break;
         case RSX_VTX_TYPE_SINT16:
-            RSX_FETCH_LOOP(v[c] = (float)(s16)((src[c * 2] << 8) | src[c * 2 + 1]))
+#ifdef RSX_FETCH_SIMD
+#define RSX_V_SI16(p, k) rsx_v_w1(_mm_cvtepi32_ps(rsx_v_s16(p, k)), k)
+            RSX_FETCH_SIZES_V(RSX_V_SI16)
+#undef RSX_V_SI16
+#else
+            RSX_FETCH_SIZES(w[c] = (float)(s16)((src[c * 2] << 8) | src[c * 2 + 1]))
+#endif
             break;
-        default:   /* RSX_VTX_TYPE_CMP32: one packed word, whatever the size */
-            for (u32 i = 0; i < count; i++)
-                if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i],
-                        (float*)(out + (size_t)i * stride + slot * 16u)))
-                    return 0;
+        default:   /* RSX_VTX_TYPE_CMP32: one packed word, whatever the size
+                    * (the same arithmetic as rsx_vertex_decode_element) */
+#ifdef RSX_FETCH_SIMD
+            RSX_FETCH_LOOP_V(rsx_v_cmp32(src))
+#else
+            RSX_FETCH_LOOP(1, {
+                const u32 word = ((u32)src[0] << 24) | ((u32)src[1] << 16) |
+                                 ((u32)src[2] << 8) | (u32)src[3];
+                s32 x = (s32)(word & 0x7FF);
+                s32 y = (s32)((word >> 11) & 0x7FF);
+                s32 z = (s32)((word >> 22) & 0x3FF);
+                if (x & 0x400) x -= 0x800;
+                if (y & 0x400) y -= 0x800;
+                if (z & 0x200) z -= 0x400;
+                w[0] = (float)x / 1023.0f;
+                w[1] = (float)y / 1023.0f;
+                w[2] = (float)z / 511.0f;
+                w[3] = 1.0f;
+            })
+#endif
             break;
         }
     }
     return 1;
 }
+#undef RSX_FETCH_SIZES
 #undef RSX_FETCH_LOOP
+#ifdef RSX_FETCH_SIMD
+#undef RSX_FETCH_SIZES_V
+#undef RSX_FETCH_LOOP_V
+#endif
 
 static u64 rsx_vertex_remap_hash(u64 value)
 {
